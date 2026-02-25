@@ -1,9 +1,7 @@
 streamlit
 pandas
 numpy
-datetime
-urllib.parse
 requests
-zipfile
-io
-plotly.express
+plotly
+openpyxl
+xlrd
