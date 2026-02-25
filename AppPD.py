@@ -79,8 +79,6 @@ def extraer_datos_coes(fecha):
                         df_prog = pd.read_excel(archivo_excel_prog, sheet_name=hoja_prog, skiprows=8, usecols="B:N", names=columnas_estandar)
                         df_prog = df_prog.dropna(subset=['Empresa', 'Equipo'], how='all')
                         df_prog = df_prog[~df_prog['Empresa'].astype(str).str.contains('TOTAL|NOTA|ELABORADO|FUENTE', case=False, na=False)]
-                else:
-                    st.sidebar.warning("Se descargó el ZIP programado pero no se encontró el archivo 'Anexo1_Intervenciones_(Osinergmin)'.")
     except Exception as e:
         st.sidebar.error(f"Error extrayendo Programado: {e}")
 
@@ -105,9 +103,6 @@ def extraer_datos_coes(fecha):
                     exito_ejecutado = True
         except Exception:
             continue
-            
-    if not exito_ejecutado:
-        st.sidebar.error("⚠️ No se pudo descargar el archivo de Mantenimientos Ejecutados. Verifique la fecha.")
 
     return df_prog, df_ejec
 
@@ -208,7 +203,7 @@ if st.session_state.dashboard_activo:
             if len(disp_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Disponibilidad_Equipo'].isin(disp_sel)]
             if len(tipo_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Tipo_Mantenimiento'].isin(tipo_sel)]
 
-            # 🔴 APLICACIÓN DE FILTROS A LOS ARCHIVOS RAW (BASE DOCUMENTAL EXACTA)
+            # 🔴 APLICACIÓN DE FILTROS A LOS ARCHIVOS RAW
             df_prog_raw_f = df_prog_raw.copy()
             if not df_prog_raw_f.empty:
                 df_prog_raw_f['Empresa_Norm'] = normalizar_texto(df_prog_raw_f['Empresa'])
@@ -221,7 +216,7 @@ if st.session_state.dashboard_activo:
                 if len(disp_sel) > 0: df_prog_raw_f = df_prog_raw_f[df_prog_raw_f['Disp_Norm'].isin(disp_sel)]
                 if len(tipo_sel) > 0: df_prog_raw_f = df_prog_raw_f[df_prog_raw_f['Tipo_Norm'].isin(tipo_sel)]
                 df_prog_raw_f = df_prog_raw_f.drop(columns=['Empresa_Norm', 'Sector', 'Disp_Norm', 'Tipo_Norm'])
-                df_prog_raw_f.index = np.arange(1, len(df_prog_raw_f) + 1) # Índice Inicia en 1
+                df_prog_raw_f.index = np.arange(1, len(df_prog_raw_f) + 1)
 
             df_ejec_raw_f = df_ejec_raw.copy()
             if not df_ejec_raw_f.empty:
@@ -235,23 +230,23 @@ if st.session_state.dashboard_activo:
                 if len(disp_sel) > 0: df_ejec_raw_f = df_ejec_raw_f[df_ejec_raw_f['Disp_Norm'].isin(disp_sel)]
                 if len(tipo_sel) > 0: df_ejec_raw_f = df_ejec_raw_f[df_ejec_raw_f['Tipo_Norm'].isin(tipo_sel)]
                 df_ejec_raw_f = df_ejec_raw_f.drop(columns=['Empresa_Norm', 'Sector', 'Disp_Norm', 'Tipo_Norm'])
-                df_ejec_raw_f.index = np.arange(1, len(df_ejec_raw_f) + 1) # Índice Inicia en 1
+                df_ejec_raw_f.index = np.arange(1, len(df_ejec_raw_f) + 1)
 
             st.markdown("---")
 
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "📊 1. Resumen y Métricas",
-                "✅ 2. MATCH: Tiempos y MW",
+                "✅ 2. MATCH: Tiempos",
                 "⚠️ 3. Ejecutados NO Programados", 
                 "❌ 4. Programados NO Ejecutados",
                 "🗄️ 5. Datos Originales (Raw)"
             ])
             
-            # --- PESTAÑA 1: RESUMEN EJECUTIVO ---
+            # --- PESTAÑA 1: RESUMEN EJECUTIVO (OCULTANDO POTENCIA Y REDISEÑANDO GRÁFICOS) ---
             with tab1:
                 st.header("📊 Informe de la Supervisión de la Programación del Mantenimiento Diario")
                 
-                # 🔴 Conteos Matemáticos Precisos con las bases filtradas
+                # Conteos
                 total_prog_raw_count = len(df_prog_raw_f) if df_prog_raw_f is not None else 0
                 total_ejec_raw_count = len(df_ejec_raw_f) if df_ejec_raw_f is not None else 0
                 
@@ -263,115 +258,116 @@ if st.session_state.dashboard_activo:
                 total_ejecutados = total_match + total_forzados
                 total_universo = len(df_filtrado)
                 
-                mw_perdidos_forzados = df_filtrado[df_filtrado['Estado_Supervision'] == 'Ejecutado NO Programado']['MW_Indisponibles_Ejec'].sum()
                 desviacion_neta = df_filtrado['Desviacion_Horas'].sum()
-                tasa_cumplimiento = (total_match / total_programados * 100) if total_programados > 0 else 0
+                porcentaje_ejec_prog = (total_match / total_ejecutados * 100) if total_ejecutados > 0 else 0
                 
+                # Resumen Ejecutivo Textual
                 texto_diagnostico = f"""
-                **📌 Resumen Ejecutivo de Operaciones:** En la ventana de supervisión, se procesaron y consolidaron **{total_prog_raw_count} mantenimientos programados** y **{total_ejec_raw_count} mantenimientos ejecutados** (bajo los filtros aplicados).
-                Se determinó una **Tasa de Cumplimiento Normativo del {tasa_cumplimiento:.1f}%** de los eventos planificados. 
-                Sin embargo, la confiabilidad del sistema fue impactada por la presencia de **{total_forzados} mantenimientos ejecutados no programados** (salidas forzadas), los cuales comprometieron **{mw_perdidos_forzados:.2f} MW** de la capacidad del SEIN.
+                **📌 Resumen Ejecutivo de Operaciones:** En la ventana de supervisión, los documentos del COES reportaron un consolidado de **{total_prog_raw_count} mantenimientos programados** y **{total_ejec_raw_count} mantenimientos ejecutados** (bajo los filtros aplicados). 
+                Se determinó que el **{porcentaje_ejec_prog:.1f}% de los mantenimientos ejecutados fueron programados previamente**. 
+                Asimismo, se registraron **{total_forzados} mantenimientos ejecutados no programados** y **{total_no_ejec} mantenimientos programados no ejecutados**.
                 """
                 st.info(texto_diagnostico)
                 
                 # ---------------------------------------------------------
                 # SECCIÓN 1: INTEGRIDAD DE LA BASE DOCUMENTAL
                 # ---------------------------------------------------------
-                st.markdown("#### 📑 1. Integridad de la Base Documental")
+                st.markdown("#### 📑 1. Base Documental (Volumen Extraído del COES)")
                 st.caption("Volúmenes de registros extraídos directamente de los archivos del COES, ajustados a los filtros actuales.")
                 
                 c_doc1, c_doc2, c_doc3 = st.columns(3)
                 c_doc1.metric("Mantenimientos Programados", total_prog_raw_count, help="Volumen del Anexo Osinergmin (Programados y Cancelados).")
                 c_doc2.metric("Mantenimientos Ejecutados", total_ejec_raw_count, help="Volumen del Anexo A (Programados/Ejecutados y Forzados).")
-                c_doc3.metric("Universo Total Único", total_universo, delta="Cruce Consolidado", delta_color="normal", help="Base de datos unificada sin duplicados.")
+                c_doc3.metric("Universo Total Único", total_universo, delta="Eventos unificados", delta_color="normal")
                 
-                col_g1, col_g2 = st.columns(2)
-                with col_g1:
-                    df_doc = pd.DataFrame({'Origen Operativo': ['Total Programados', 'Total Ejecutados'], 'Volumen': [total_prog_raw_count, total_ejec_raw_count]})
-                    fig_bar_doc = px.bar(df_doc, x='Origen Operativo', y='Volumen', color='Origen Operativo', text_auto=True, title="Comparativa de Volúmenes Documentales", color_discrete_sequence=['#1f77b4', '#ff7f0e'])
-                    fig_bar_doc.update_layout(showlegend=False)
-                    st.plotly_chart(fig_bar_doc, use_container_width=True)
-                    
-                with col_g2:
-                    df_estado_counts = df_filtrado['Estado_Supervision'].value_counts().reset_index()
-                    df_estado_counts.columns = ['Estado Operativo', 'Cantidad']
-                    fig_pie_univ = px.pie(df_estado_counts, values='Cantidad', names='Estado Operativo', hole=0.4, title="Estructura del Universo de Mantenimientos", color='Estado Operativo', color_discrete_map={'Programado y Ejecutado': '#2ca02c', 'Ejecutado NO Programado': '#d62728', 'Programado NO Ejecutado': '#ff7f0e'})
-                    fig_pie_univ.update_traces(textinfo='value+percent', textfont_size=14, hoverinfo='label+percent+value')
-                    st.plotly_chart(fig_pie_univ, use_container_width=True)
-
-                st.markdown("---")
-
                 # ---------------------------------------------------------
                 # SECCIÓN 2: RESULTADOS DE LA SUPERVISIÓN
                 # ---------------------------------------------------------
                 st.markdown("#### 🔍 2. Resultados de la Supervisión Operativa")
-                st.caption("Evaluación del impacto en los tiempos de ejecución y capacidad (MW).")
+                st.caption("Distribución exacta de los eventos y nivel de alineación operativa.")
                 
                 c_res1, c_res2, c_res3, c_res4 = st.columns(4)
                 c_res1.metric("Programado y Ejecutado", total_match, help="Cumplieron con planificar y ejecutar.")
-                c_res2.metric("Ejecutado NO Programado", total_forzados, delta=f"-{mw_perdidos_forzados:.1f} MW", delta_color="inverse")
+                c_res2.metric("Ejecutado NO Programado", total_forzados, help="Eventos intempestivos o de emergencia.")
                 c_res3.metric("Programado NO Ejecutado", total_no_ejec, help="Se programaron pero no se realizaron.")
+                c_res4.metric("🎯 Ejecutados que fueron Programados", f"{porcentaje_ejec_prog:.1f}%", help="Porcentaje de la ejecución total que sí estuvo planificada.")
                 
-                if desviacion_neta > 0:
-                    c_res4.metric("Desviación Neta (Horas)", f"+{desviacion_neta:.2f} h", delta="Exceso / Retraso", delta_color="inverse")
-                elif desviacion_neta < 0:
-                    c_res4.metric("Desviación Neta (Horas)", f"{desviacion_neta:.2f} h", delta="Ahorro Operativo", delta_color="normal")
-                else:
-                    c_res4.metric("Desviación Neta (Horas)", "0.00 h", delta="Ejecución Perfecta", delta_color="off")
-                
+                # Alerta Directiva
                 st.markdown("<br>", unsafe_allow_html=True)
                 if desviacion_neta > 0 or total_forzados > 0:
-                    st.warning(f"**⚠️ Alerta Directiva de Supervisión:** El SEIN registró **{total_forzados}** mantenimientos no programados y un retraso acumulado de **{desviacion_neta:.2f} horas**. Por favor, analice las gráficas inferiores de impacto.")
+                    st.warning(f"**⚠️ Alerta de Supervisión:** Se registraron **{total_forzados}** mantenimientos ejecutados no programados y un retraso neto de **{desviacion_neta:.2f} horas** en el sistema operativo.")
                 else:
-                    st.success("**✅ Operación Óptima:** Las empresas concesionarias han operado el SEIN respetando los márgenes de tiempo estipulados y no se detectaron salidas intempestivas.")
+                    st.success("**✅ Operación Óptima:** Las empresas han operado respetando los márgenes de tiempo estipulados y no se detectaron ejecuciones sin programación.")
                 
-                col_g3, col_g4 = st.columns(2)
-                with col_g3:
-                    df_mw_melt = df_filtrado.groupby('Estado_Supervision')[['MW_Indisponibles_Prog', 'MW_Indisponibles_Ejec']].sum().reset_index()
-                    df_mw_melt = df_mw_melt.melt(id_vars='Estado_Supervision', var_name='Fase', value_name='Megavatios (MW)')
-                    df_mw_melt['Fase'] = df_mw_melt['Fase'].replace({'MW_Indisponibles_Prog': 'MW Programado', 'MW_Indisponibles_Ejec': 'MW Ejecutado'})
-                    
-                    fig_bar_mw = px.bar(df_mw_melt, x='Estado_Supervision', y='Megavatios (MW)', color='Fase', barmode='group', text_auto='.1f', title="Impacto de Indisponibilidad (MW) por Evento", color_discrete_map={'MW Programado': '#1f77b4', 'MW Ejecutado': '#ff7f0e'})
-                    st.plotly_chart(fig_bar_mw, use_container_width=True)
+                # GRÁFICOS NO REPETITIVOS (Distribución y Retrasos)
+                col_g1, col_g2 = st.columns(2)
+                with col_g1:
+                    df_estado_counts = df_filtrado['Estado_Supervision'].value_counts().reset_index()
+                    df_estado_counts.columns = ['Estado Operativo', 'Cantidad']
+                    fig_pie_univ = px.pie(df_estado_counts, values='Cantidad', names='Estado Operativo', hole=0.4, title="Distribución de Estados Operativos del SEIN", color='Estado Operativo', color_discrete_map={'Programado y Ejecutado': '#2ca02c', 'Ejecutado NO Programado': '#d62728', 'Programado NO Ejecutado': '#ff7f0e'})
+                    fig_pie_univ.update_traces(textinfo='value+percent', textfont_size=14, hoverinfo='label+percent+value')
+                    st.plotly_chart(fig_pie_univ, use_container_width=True)
 
-                with col_g4:
+                with col_g2:
                     df_excesos = df_filtrado[df_filtrado['Desviacion_Horas'] > 0]
                     if not df_excesos.empty:
                         df_agrupado = df_excesos.groupby('Empresa')['Desviacion_Horas'].sum().reset_index()
                         df_agrupado = df_agrupado.sort_values('Desviacion_Horas', ascending=False).head(10)
                         fig_bar_tiempo = px.bar(df_agrupado, x='Desviacion_Horas', y='Empresa', orientation='h', title="Top 10 Empresas con Mayor Retraso en Ejecución (Horas)", text_auto='.2f', color='Desviacion_Horas', color_continuous_scale='Reds')
                         fig_bar_tiempo.update_layout(yaxis={'categoryorder':'total ascending'})
+                        fig_bar_tiempo.update_traces(textposition='outside', textfont_size=12)
                         st.plotly_chart(fig_bar_tiempo, use_container_width=True)
                     else:
                         st.success("✅ Excelente: No se registraron empresas con excesos de tiempo de mantenimiento.")
 
                 st.markdown("---")
                 
-                st.markdown("#### ⏱️ Análisis de Tiempos Exclusivo (Programado y Ejecutado)")
+                # ---------------------------------------------------------
+                # SECCIÓN 3: ESTADÍSTICAS DE DURACIÓN Y EFICIENCIA
+                # ---------------------------------------------------------
+                st.markdown("#### ⏱️ Análisis de Tiempos de Ejecución (Programado y Ejecutado)")
                 df_match_kpi = df_filtrado[df_filtrado['Estado_Supervision'] == 'Programado y Ejecutado'].copy()
                 
                 if not df_match_kpi.empty:
                     df_match_kpi['Desempeño_Tiempo'] = np.where(df_match_kpi['Desviacion_Horas'] > 0, 'Excedieron Programación (Retraso)', 
                                                    np.where(df_match_kpi['Desviacion_Horas'] < 0, 'Terminaron Antes (Ahorro)', 'Ejecución Exacta'))
                     
+                    col_t1, col_t2, col_t3, col_t4 = st.columns(4)
+                    cant_mayor = len(df_match_kpi[df_match_kpi['Desviacion_Horas'] > 0])
+                    cant_menor = len(df_match_kpi[df_match_kpi['Desviacion_Horas'] < 0])
+                    cant_exacto = len(df_match_kpi[df_match_kpi['Desviacion_Horas'] == 0])
+                    
+                    if desviacion_neta > 0: col_t1.metric("Desviación Neta (Horas)", f"+{desviacion_neta:.2f} h", delta="Retraso Acumulado", delta_color="inverse")
+                    elif desviacion_neta < 0: col_t1.metric("Desviación Neta (Horas)", f"{desviacion_neta:.2f} h", delta="Ahorro Operativo", delta_color="normal")
+                    else: col_t1.metric("Desviación Neta (Horas)", "0.00 h", delta="Sincronización Exacta", delta_color="off")
+                    
+                    col_t2.metric("Excedieron Programación", cant_mayor)
+                    col_t3.metric("Terminaron Antes", cant_menor)
+                    col_t4.metric("Ejecución Exacta", cant_exacto)
+
                     col_gt1, col_gt2 = st.columns(2)
                     with col_gt1:
                         tiempos_counts = df_match_kpi['Desempeño_Tiempo'].value_counts().reset_index()
                         tiempos_counts.columns = ['Eficiencia', 'Cantidad']
-                        fig_pie_tiempos = px.pie(tiempos_counts, values='Cantidad', names='Eficiencia', hole=0.4, title="Proporción de Eficiencia en Tiempos de Maniobra", color='Eficiencia', color_discrete_map={'Excedieron Programación (Retraso)': '#d62728', 'Terminaron Antes (Ahorro)': '#2ca02c', 'Ejecución Exacta': '#1f77b4'})
+                        fig_pie_tiempos = px.pie(tiempos_counts, values='Cantidad', names='Eficiencia', hole=0.4, title="Eficiencia en Tiempos de Maniobra", color='Eficiencia', color_discrete_map={'Excedieron Programación (Retraso)': '#d62728', 'Terminaron Antes (Ahorro)': '#2ca02c', 'Ejecución Exacta': '#1f77b4'})
                         fig_pie_tiempos.update_traces(textinfo='value+percent', textfont_size=14, hoverinfo='label+percent+value')
                         st.plotly_chart(fig_pie_tiempos, use_container_width=True)
                         
                     with col_gt2:
                         df_sector_tiempos = df_match_kpi.groupby('Sector')[['Horas_Prog', 'Horas_Ejec']].sum().reset_index()
                         df_sector_tiempos_melted = df_sector_tiempos.melt(id_vars='Sector', value_vars=['Horas_Prog', 'Horas_Ejec'], var_name='Tipo', value_name='Horas')
-                        df_sector_tiempos_melted['Tipo'] = df_sector_tiempos_melted['Tipo'].replace({'Horas_Prog': 'Horas Programadas', 'Horas_Ejec': 'Horas Ejecutadas'})
-                        fig_bar_tiempos = px.bar(df_sector_tiempos_melted, x='Sector', y='Horas', color='Tipo', barmode='group', title="Volumen de Horas Operativas por Sector", color_discrete_map={'Horas Programadas': '#1f77b4', 'Horas Ejecutadas': '#ff7f0e'}, text_auto='.1f')
+                        df_sector_tiempos_melted['Tipo'] = df_sector_tiempos_melted['Tipo'].replace({'Horas_Prog': 'H. Programadas', 'Horas_Ejec': 'H. Ejecutadas'})
+                        fig_bar_tiempos = px.bar(df_sector_tiempos_melted, x='Sector', y='Horas', color='Tipo', barmode='group', title="Volumen de Horas Operativas por Sector", color_discrete_map={'H. Programadas': '#1f77b4', 'H. Ejecutadas': '#ff7f0e'}, text_auto='.1f')
+                        fig_bar_tiempos.update_traces(textposition='outside', textfont_size=12)
                         st.plotly_chart(fig_bar_tiempos, use_container_width=True)
                 else:
                     st.info("No hay mantenimientos ejecutados bajo programación (Match) para generar métricas de eficiencia.")
                 
                 st.markdown("---")
+                
+                # ---------------------------------------------------------
+                # SECCIÓN 4: ESTADÍSTICAS POR TIPO DE MANTENIMIENTO
+                # ---------------------------------------------------------
                 st.markdown("#### 🛠️ Estadísticas Operativas por Tipo de Mantenimiento")
                 col_tm1, col_tm2 = st.columns(2)
                 with col_tm1:
@@ -386,28 +382,8 @@ if st.session_state.dashboard_activo:
                     df_tipo_horas_melted = df_tipo_horas.melt(id_vars='Tipo_Mantenimiento', value_vars=['Horas_Prog', 'Horas_Ejec'], var_name='Fase', value_name='Total de Horas')
                     df_tipo_horas_melted['Fase'] = df_tipo_horas_melted['Fase'].replace({'Horas_Prog': 'H. Programadas', 'Horas_Ejec': 'H. Ejecutadas'})
                     fig_bar_tipo = px.bar(df_tipo_horas_melted, x='Tipo_Mantenimiento', y='Total de Horas', color='Fase', barmode='group', title="Consumo de Horas (Prog vs Ejec) por Tipo de Maniobra", color_discrete_map={'H. Programadas': '#1f77b4', 'H. Ejecutadas': '#ff7f0e'}, text_auto='.1f')
+                    fig_bar_tipo.update_traces(textposition='outside', textfont_size=12)
                     st.plotly_chart(fig_bar_tipo, use_container_width=True)
-
-                st.markdown("---")
-                st.markdown("#### Análisis Gráfico de Supervisión Global")
-                col_graf1, col_graf2 = st.columns(2)
-                with col_graf1:
-                    estado_counts = df_filtrado['Estado_Supervision'].value_counts().reset_index()
-                    estado_counts.columns = ['Estado', 'Cantidad']
-                    fig_pie = px.pie(estado_counts, values='Cantidad', names='Estado', hole=0.4, title="Distribución de Todos los Eventos Operativos", color='Estado', color_discrete_map={'Programado y Ejecutado': '#2ca02c', 'Ejecutado NO Programado': '#d62728', 'Programado NO Ejecutado': '#ff7f0e'})
-                    fig_pie.update_traces(textinfo='value+percent', textfont_size=14, hoverinfo='label+percent+value')
-                    st.plotly_chart(fig_pie, use_container_width=True)
-                    
-                with col_graf2:
-                    df_excesos = df_filtrado[df_filtrado['Desviacion_Horas'] > 0]
-                    if not df_excesos.empty:
-                        df_agrupado = df_excesos.groupby('Empresa')['Desviacion_Horas'].sum().reset_index()
-                        df_agrupado = df_agrupado.sort_values('Desviacion_Horas', ascending=False).head(10)
-                        fig_bar_tiempo = px.bar(df_agrupado, x='Desviacion_Horas', y='Empresa', orientation='h', title="Top 10: Empresas con Mayores Retrasos (Horas Acumuladas)", text_auto='.2f', color='Desviacion_Horas', color_continuous_scale='Reds')
-                        fig_bar_tiempo.update_layout(yaxis={'categoryorder':'total ascending'})
-                        st.plotly_chart(fig_bar_tiempo, use_container_width=True)
-                    else:
-                        st.success("✅ Excelente: No se registraron empresas con retrasos operacionales.")
 
             # --- PESTAÑA 2: MATCH ---
             with tab2:
