@@ -236,7 +236,7 @@ if st.session_state.dashboard_activo:
 
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "📊 1. Resumen y Métricas",
-                "✅ 2. MATCH: Tiempos",
+                "✅ 2. MATCH: Tiempos y MW",
                 "⚠️ 3. Ejecutados NO Programados", 
                 "❌ 4. Programados NO Ejecutados",
                 "🗄️ 5. Datos Originales (Raw)"
@@ -261,11 +261,13 @@ if st.session_state.dashboard_activo:
                 desviacion_neta = df_filtrado['Desviacion_Horas'].sum()
                 porcentaje_ejec_prog = (total_match / total_ejecutados * 100) if total_ejecutados > 0 else 0
                 
-                # Resumen Ejecutivo Textual
+                # Resumen Ejecutivo Textual con Aclaración de Desviación Neta
                 texto_diagnostico = f"""
                 **📌 Resumen Ejecutivo de Operaciones:** En la ventana de supervisión, los documentos del COES reportaron un consolidado de **{total_prog_raw_count} mantenimientos programados** y **{total_ejec_raw_count} mantenimientos ejecutados** (bajo los filtros aplicados). 
                 Se determinó que el **{porcentaje_ejec_prog:.1f}% de los mantenimientos ejecutados fueron programados previamente**. 
                 Asimismo, se registraron **{total_forzados} mantenimientos ejecutados no programados** y **{total_no_ejec} mantenimientos programados no ejecutados**.
+
+                *💡 Nota sobre la Desviación Neta (Horas):* Un valor **positivo (+)** indica un **retraso neto** en el sistema (las maniobras tomaron más tiempo del planificado), mientras que un valor **negativo (-)** indica un **ahorro operativo** (las unidades retornaron al servicio antes de lo previsto).
                 """
                 st.info(texto_diagnostico)
                 
