@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import urllib.parse
 import requests
 import zipfile
@@ -80,7 +80,7 @@ def extraer_datos_coes(fecha):
                         df_prog = df_prog.dropna(subset=['Empresa', 'Equipo'], how='all')
                         df_prog = df_prog[~df_prog['Empresa'].astype(str).str.contains('TOTAL|NOTA|ELABORADO|FUENTE', case=False, na=False)]
     except Exception as e:
-        st.sidebar.error(f"Error extrayendo Programado: {e}")
+        pass # Silenciamos errores por día para que el rango no colapse
 
     # 2.2 EXTRACCIÓN DEL EJECUTADO
     exito_ejecutado = False
@@ -106,6 +106,35 @@ def extraer_datos_coes(fecha):
 
     return df_prog, df_ejec
 
+def obtener_datos_rango(fecha_inicio, fecha_fin):
+    dfs_prog = []
+    dfs_ejec = []
+    rango_dias = pd.date_range(fecha_inicio, fecha_fin)
+    total_dias = len(rango_dias)
+    
+    barra_progreso = st.progress(0)
+    texto_progreso = st.empty()
+    
+    for i, d in enumerate(rango_dias):
+        texto_progreso.text(f"⏳ Descargando y procesando IEOD del {d.strftime('%d/%m/%Y')} ({i+1}/{total_dias})...")
+        df_p, df_e = extraer_datos_coes(d)
+        
+        if df_p is not None and not df_p.empty:
+            df_p.insert(0, 'Fecha_Operacion', d.date())
+            dfs_prog.append(df_p)
+        if df_e is not None and not df_e.empty:
+            df_e.insert(0, 'Fecha_Operacion', d.date())
+            dfs_ejec.append(df_e)
+            
+        barra_progreso.progress((i + 1) / total_dias)
+    
+    texto_progreso.empty()
+    barra_progreso.empty()
+        
+    df_prog_final = pd.concat(dfs_prog, ignore_index=True) if dfs_prog else pd.DataFrame()
+    df_ejec_final = pd.concat(dfs_ejec, ignore_index=True) if dfs_ejec else pd.DataFrame()
+    return df_prog_final, df_ejec_final
+
 # --- 3. FUNCIONES GLOBALES DE NORMALIZACIÓN ---
 def normalizar_texto(serie):
     return serie.astype(str).str.strip().str.upper().str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8')
@@ -122,13 +151,16 @@ def determinar_sector(row):
 # --- 4. MOTOR DE CONCILIACIÓN ---
 def conciliar_datos(df_prog, df_ejec):
     for df in [df_prog, df_ejec]:
-        if df is not None:
+        if not df.empty:
             df['Empresa'] = normalizar_texto(df['Empresa'])
             df['Equipo'] = normalizar_texto(df['Equipo'])
             df.replace(['NAN', 'NAT', ''], np.nan, inplace=True)
-            df['Seq_Mantenimiento'] = df.groupby(['Empresa', 'Equipo']).cumcount()
+            df['Seq_Mantenimiento'] = df.groupby(['Fecha_Operacion', 'Empresa', 'Equipo']).cumcount()
             
-    df_merged = pd.merge(df_prog, df_ejec, on=['Empresa', 'Equipo', 'Seq_Mantenimiento'], how='outer', suffixes=('_Prog', '_Ejec'), indicator=True)
+    if df_prog.empty: df_prog['Seq_Mantenimiento'] = []
+    if df_ejec.empty: df_ejec['Seq_Mantenimiento'] = []
+
+    df_merged = pd.merge(df_prog, df_ejec, on=['Fecha_Operacion', 'Empresa', 'Equipo', 'Seq_Mantenimiento'], how='outer', suffixes=('_Prog', '_Ejec'), indicator=True)
     df_merged.drop(columns=['Seq_Mantenimiento'], inplace=True, errors='ignore')
     
     def estado_supervision(row):
@@ -165,8 +197,15 @@ def conciliar_datos(df_prog, df_ejec):
     return df_merged
 
 # --- 5. INTERFAZ GRÁFICA Y MANEJO DE ESTADO ---
-st.sidebar.header("Informe de Programación Diaria")
-fecha_seleccionada = st.sidebar.date_input("Seleccione Fecha de Operación", datetime.today())
+st.sidebar.header("Informe de Programación de Mantenimientos")
+
+hoy = datetime.today()
+rango_fechas = st.sidebar.date_input("Seleccione Rango de Fechas Operativas", value=(hoy, hoy))
+
+if len(rango_fechas) == 2:
+    fecha_inicio, fecha_fin = rango_fechas
+else:
+    fecha_inicio = fecha_fin = rango_fechas[0]
 
 if 'dashboard_activo' not in st.session_state:
     st.session_state.dashboard_activo = False
@@ -175,10 +214,10 @@ if st.sidebar.button("Procesar Información"):
     st.session_state.dashboard_activo = True
 
 if st.session_state.dashboard_activo:
-    with st.spinner("Construyendo Tablero Gerencial y sincronizando métricas..."):
-        df_prog_raw, df_ejec_raw = extraer_datos_coes(fecha_seleccionada)
+    with st.spinner("Compilando bases de datos y sincronizando métricas operativas..."):
+        df_prog_raw, df_ejec_raw = obtener_datos_rango(fecha_inicio, fecha_fin)
         
-        if df_prog_raw is not None and df_ejec_raw is not None:
+        if not df_prog_raw.empty or not df_ejec_raw.empty:
             df_conciliado = conciliar_datos(df_prog_raw.copy(), df_ejec_raw.copy())
             
             st.markdown("### 🎛️ Filtros Dinámicos")
@@ -188,7 +227,8 @@ if st.session_state.dashboard_activo:
             empresa_sel = col_f1.multiselect("Empresa Concesionaria:", empresas_disp, default=[])
             
             sectores_disp = sorted(df_conciliado['Sector'].unique())
-            sector_sel = col_f2.multiselect("Sector (Gen/Trans):", sectores_disp, default=sectores_disp)
+            default_sector = ['GENERACIÓN'] if 'GENERACIÓN' in sectores_disp else []
+            sector_sel = col_f2.multiselect("Sector (Gen/Trans):", sectores_disp, default=default_sector)
             
             disp_equipos = sorted(df_conciliado[df_conciliado['Disponibilidad_Equipo'] != 'NAN']['Disponibilidad_Equipo'].unique())
             disp_sel = col_f3.multiselect("Estado (E/S o F/S):", disp_equipos, default=disp_equipos)
@@ -196,14 +236,14 @@ if st.session_state.dashboard_activo:
             tipos_disp = sorted(df_conciliado[df_conciliado['Tipo_Mantenimiento'] != 'NO ESPECIFICADO']['Tipo_Mantenimiento'].unique())
             tipo_sel = col_f4.multiselect("Tipo de Mantenimiento:", tipos_disp, default=[])
             
-            # 🔴 APLICACIÓN DE FILTROS AL UNIVERSO CONCILIADO
+            # APLICACIÓN DE FILTROS AL UNIVERSO CONCILIADO
             df_filtrado = df_conciliado.copy()
             if len(empresa_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Empresa'].isin(empresa_sel)]
             if len(sector_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Sector'].isin(sector_sel)]
             if len(disp_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Disponibilidad_Equipo'].isin(disp_sel)]
             if len(tipo_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Tipo_Mantenimiento'].isin(tipo_sel)]
 
-            # 🔴 APLICACIÓN DE FILTROS A LOS ARCHIVOS RAW
+            # APLICACIÓN DE FILTROS A LA BASE DOCUMENTAL RAW
             df_prog_raw_f = df_prog_raw.copy()
             if not df_prog_raw_f.empty:
                 df_prog_raw_f['Empresa_Norm'] = normalizar_texto(df_prog_raw_f['Empresa'])
@@ -236,17 +276,16 @@ if st.session_state.dashboard_activo:
 
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "📊 1. Resumen y Métricas",
-                "✅ 2. MATCH: Tiempos y MW",
+                "✅ 2. MATCH: Tiempos",
                 "⚠️ 3. Ejecutados NO Programados", 
                 "❌ 4. Programados NO Ejecutados",
                 "🗄️ 5. Datos Originales (Raw)"
             ])
             
-            # --- PESTAÑA 1: RESUMEN EJECUTIVO (OCULTANDO POTENCIA Y REDISEÑANDO GRÁFICOS) ---
+            # --- PESTAÑA 1: RESUMEN EJECUTIVO ---
             with tab1:
-                st.header("📊 Informe de la Supervisión de la Programación del Mantenimiento Diario")
+                st.header(f"📊 Informe de Supervisión del Sistema Interconectado Nacional")
                 
-                # Conteos
                 total_prog_raw_count = len(df_prog_raw_f) if df_prog_raw_f is not None else 0
                 total_ejec_raw_count = len(df_ejec_raw_f) if df_ejec_raw_f is not None else 0
                 
@@ -261,19 +300,33 @@ if st.session_state.dashboard_activo:
                 desviacion_neta = df_filtrado['Desviacion_Horas'].sum()
                 porcentaje_ejec_prog = (total_match / total_ejecutados * 100) if total_ejecutados > 0 else 0
                 
-                # Resumen Ejecutivo Textual con Aclaración de Desviación Neta
+                # 🔴 CÁLCULO DE LOS DATOS CRÍTICOS POR EMPRESA
+                texto_datos_criticos = ""
+                df_ejecutados_total = df_filtrado[df_filtrado['Estado_Supervision'].isin(['Programado y Ejecutado', 'Ejecutado NO Programado'])]
+                if not df_ejecutados_total.empty:
+                    # Empresa con mayor cantidad de registros
+                    empresa_max_registros = df_ejecutados_total['Empresa'].value_counts().idxmax()
+                    max_registros = df_ejecutados_total['Empresa'].value_counts().max()
+                    
+                    # Empresa con mayor tiempo acumulado
+                    df_empresa_horas = df_ejecutados_total.groupby('Empresa')['Horas_Ejec'].sum().reset_index()
+                    empresa_max_horas = df_empresa_horas.loc[df_empresa_horas['Horas_Ejec'].idxmax(), 'Empresa']
+                    max_horas = df_empresa_horas['Horas_Ejec'].max()
+                    
+                    texto_datos_criticos = f"\n\n🚨 *Datos Críticos:* La empresa que registró la mayor cantidad de intervenciones ejecutadas fue **{empresa_max_registros}** ({max_registros} maniobras). Asimismo, la empresa que acumuló el mayor tiempo operativo de mantenimiento fue **{empresa_max_horas}** con un total de **{max_horas:.2f} horas**."
+
+                # Resumen Ejecutivo 
                 texto_diagnostico = f"""
                 **📌 Resumen Ejecutivo de Operaciones:** En la ventana de supervisión, los documentos del COES reportaron un consolidado de **{total_prog_raw_count} mantenimientos programados** y **{total_ejec_raw_count} mantenimientos ejecutados** (bajo los filtros aplicados). 
                 Se determinó que el **{porcentaje_ejec_prog:.1f}% de los mantenimientos ejecutados fueron programados previamente**. 
-                Asimismo, se registraron **{total_forzados} mantenimientos ejecutados no programados** y **{total_no_ejec} mantenimientos programados no ejecutados**.
-
-                *💡 Nota sobre la Desviación Neta (Horas):* Un valor **positivo (+)** indica un **retraso neto** en el sistema (las maniobras tomaron más tiempo del planificado), mientras que un valor **negativo (-)** indica un **ahorro operativo** (las unidades retornaron al servicio antes de lo previsto).
+                Asimismo, se registraron **{total_forzados} mantenimientos ejecutados no programados** y **{total_no_ejec} mantenimientos programados no ejecutados**.{texto_datos_criticos}
                 """
                 st.info(texto_diagnostico)
                 
-                # ---------------------------------------------------------
-                # SECCIÓN 1: INTEGRIDAD DE LA BASE DOCUMENTAL
-                # ---------------------------------------------------------
+                # 🔴 NOTA COMO TEXTO NORMAL (Fuera de la caja info)
+                st.markdown("*💡 **Nota sobre la Desviación Neta (Horas):*** Un valor **positivo (+)** indica un **retraso neto** en el sistema (las maniobras tomaron más tiempo del planificado), mientras que un valor **negativo (-)** indica un **ahorro operativo** (las unidades retornaron al servicio antes de lo previsto).")
+                
+                # SECCIÓN 1
                 st.markdown("#### 📑 1. Base Documental (Volumen Extraído del COES)")
                 st.caption("Volúmenes de registros extraídos directamente de los archivos del COES, ajustados a los filtros actuales.")
                 
@@ -282,9 +335,7 @@ if st.session_state.dashboard_activo:
                 c_doc2.metric("Mantenimientos Ejecutados", total_ejec_raw_count, help="Volumen del Anexo A (Programados/Ejecutados y Forzados).")
                 c_doc3.metric("Universo Total Único", total_universo, delta="Eventos unificados", delta_color="normal")
                 
-                # ---------------------------------------------------------
-                # SECCIÓN 2: RESULTADOS DE LA SUPERVISIÓN
-                # ---------------------------------------------------------
+                # SECCIÓN 2
                 st.markdown("#### 🔍 2. Resultados de la Supervisión Operativa")
                 st.caption("Distribución exacta de los eventos y nivel de alineación operativa.")
                 
@@ -294,14 +345,12 @@ if st.session_state.dashboard_activo:
                 c_res3.metric("Programado NO Ejecutado", total_no_ejec, help="Se programaron pero no se realizaron.")
                 c_res4.metric("🎯 Ejecutados que fueron Programados", f"{porcentaje_ejec_prog:.1f}%", help="Porcentaje de la ejecución total que sí estuvo planificada.")
                 
-                # Alerta Directiva
                 st.markdown("<br>", unsafe_allow_html=True)
                 if desviacion_neta > 0 or total_forzados > 0:
                     st.warning(f"**⚠️ Alerta de Supervisión:** Se registraron **{total_forzados}** mantenimientos ejecutados no programados y un retraso neto de **{desviacion_neta:.2f} horas** en el sistema operativo.")
                 else:
                     st.success("**✅ Operación Óptima:** Las empresas han operado respetando los márgenes de tiempo estipulados y no se detectaron ejecuciones sin programación.")
                 
-                # GRÁFICOS NO REPETITIVOS (Distribución y Retrasos)
                 col_g1, col_g2 = st.columns(2)
                 with col_g1:
                     df_estado_counts = df_filtrado['Estado_Supervision'].value_counts().reset_index()
@@ -319,15 +368,54 @@ if st.session_state.dashboard_activo:
                         fig_bar_tiempo.update_layout(yaxis={'categoryorder':'total ascending'})
                         fig_bar_tiempo.update_traces(textposition='outside', textfont_size=12)
                         st.plotly_chart(fig_bar_tiempo, use_container_width=True)
-                    else:
-                        st.success("✅ Excelente: No se registraron empresas con excesos de tiempo de mantenimiento.")
 
                 st.markdown("---")
                 
                 # ---------------------------------------------------------
-                # SECCIÓN 3: ESTADÍSTICAS DE DURACIÓN Y EFICIENCIA
+                # SECCIÓN 3: CRONOGRAMA GANTT OPERATIVO (DINÁMICO)
                 # ---------------------------------------------------------
-                st.markdown("#### ⏱️ Análisis de Tiempos de Ejecución (Programado y Ejecutado)")
+                st.markdown("#### 📅 3. Cronograma de Indisponibilidades Operativas (Gantt)")
+                st.caption("Visualización temporal de las Centrales y Unidades operadas. La gráfica se expande automáticamente para asegurar la legibilidad de todos los nombres.")
+                
+                df_gantt = df_filtrado[df_filtrado['Estado_Supervision'].isin(['Programado y Ejecutado', 'Ejecutado NO Programado'])].copy()
+                
+                if not df_gantt.empty:
+                    df_gantt['Inicio_DT'] = pd.to_datetime(df_gantt['Inicio_Ejec'], format='%d/%m/%Y %H:%M', errors='coerce')
+                    df_gantt['Fin_DT'] = pd.to_datetime(df_gantt['Fin_Ejec'], format='%d/%m/%Y %H:%M', errors='coerce')
+                    df_gantt = df_gantt.dropna(subset=['Inicio_DT', 'Fin_DT'])
+                    
+                    if not df_gantt.empty:
+                        df_gantt['Central_Unidad'] = df_gantt['Central/Ubicacion'] + " | " + df_gantt['Equipo']
+                        
+                        num_y_items = len(df_gantt['Central_Unidad'].unique())
+                        altura_dinamica = max(400, num_y_items * 35) 
+                        
+                        fig_gantt = px.timeline(
+                            df_gantt, 
+                            x_start="Inicio_DT", 
+                            x_end="Fin_DT", 
+                            y="Central_Unidad", 
+                            color="Disponibilidad_Equipo",
+                            hover_name="Empresa",
+                            hover_data={"Tipo_Mantenimiento": True, "Estado_Supervision": True, "Disponibilidad_Equipo": False},
+                            title="Línea de Tiempo por Estado (E/S - F/S)",
+                            color_discrete_map={'F/S': '#d62728', 'E/S': '#2ca02c', 'NO ESPECIFICADO': '#7f7f7f'},
+                            height=altura_dinamica 
+                        )
+                        fig_gantt.update_yaxes(autorange="reversed") 
+                        fig_gantt.update_layout(xaxis_title="Fechas y Horas de Operación", yaxis_title="Centrales / Unidades")
+                        st.plotly_chart(fig_gantt, use_container_width=True)
+                    else:
+                        st.info("⚠️ Los registros de ejecución actuales no poseen un formato de fecha y hora válido para diagramar el cronograma.")
+                else:
+                    st.info("⚠️ No hay eventos ejecutados bajo los filtros actuales para graficar el Cronograma.")
+
+                st.markdown("---")
+                
+                # ---------------------------------------------------------
+                # SECCIÓN 4: ESTADÍSTICAS DE DURACIÓN Y EFICIENCIA
+                # ---------------------------------------------------------
+                st.markdown("#### ⏱️ 4. Análisis de Tiempos Exclusivo (Programado y Ejecutado)")
                 df_match_kpi = df_filtrado[df_filtrado['Estado_Supervision'] == 'Programado y Ejecutado'].copy()
                 
                 if not df_match_kpi.empty:
@@ -368,9 +456,9 @@ if st.session_state.dashboard_activo:
                 st.markdown("---")
                 
                 # ---------------------------------------------------------
-                # SECCIÓN 4: ESTADÍSTICAS POR TIPO DE MANTENIMIENTO
+                # SECCIÓN 5: ESTADÍSTICAS POR TIPO DE MANTENIMIENTO
                 # ---------------------------------------------------------
-                st.markdown("#### 🛠️ Estadísticas Operativas por Tipo de Mantenimiento")
+                st.markdown("#### 🛠️ 5. Estadísticas Operativas por Tipo de Mantenimiento")
                 col_tm1, col_tm2 = st.columns(2)
                 with col_tm1:
                     tipo_counts = df_filtrado['Tipo_Mantenimiento'].value_counts().reset_index()
@@ -395,7 +483,7 @@ if st.session_state.dashboard_activo:
                 if not df_tab2.empty:
                     df_tab2['Estado_Tiempo'] = np.where(df_tab2['Desviacion_Horas'] > 0, '🔴 Mayor Tiempo', 
                                                np.where(df_tab2['Desviacion_Horas'] < 0, '🟠 Menor Tiempo', '🟢 Tiempo Exacto'))
-                    columnas_tab2 = ['Estado_Tiempo', 'Empresa', 'Central/Ubicacion', 'Equipo', 'Sector', 'Tipo_Mantenimiento', 'Disponibilidad_Equipo', 
+                    columnas_tab2 = ['Fecha_Operacion', 'Estado_Tiempo', 'Empresa', 'Central/Ubicacion', 'Equipo', 'Sector', 'Tipo_Mantenimiento', 'Disponibilidad_Equipo', 
                                      'Inicio_Prog', 'Fin_Prog', 'Horas_Prog', 
                                      'Inicio_Ejec', 'Fin_Ejec', 'Horas_Ejec', 'Desviacion_Horas',
                                      'MW_Indisponibles_Prog', 'MW_Indisponibles_Ejec', 'Desviacion_MW', 'Descripcion_Ejec']
@@ -410,7 +498,7 @@ if st.session_state.dashboard_activo:
                 st.subheader("⚠️ Mantenimientos Ejecutados NO Programados")
                 df_tab3 = df_filtrado[df_filtrado['Estado_Supervision'] == 'Ejecutado NO Programado'].copy()
                 if not df_tab3.empty:
-                    columnas_tab3 = ['Empresa', 'Central/Ubicacion', 'Equipo', 'Sector', 'Tipo_Mantenimiento', 'Disponibilidad_Equipo', 'Inicio_Ejec', 'Fin_Ejec', 'Horas_Ejec', 'MW_Indisponibles_Ejec', 'Descripcion_Ejec']
+                    columnas_tab3 = ['Fecha_Operacion', 'Empresa', 'Central/Ubicacion', 'Equipo', 'Sector', 'Tipo_Mantenimiento', 'Disponibilidad_Equipo', 'Inicio_Ejec', 'Fin_Ejec', 'Horas_Ejec', 'MW_Indisponibles_Ejec', 'Descripcion_Ejec']
                     df_tab3_show = df_tab3[columnas_tab3].copy()
                     df_tab3_show.index = np.arange(1, len(df_tab3_show) + 1) 
                     st.dataframe(df_tab3_show, use_container_width=True)
@@ -422,7 +510,7 @@ if st.session_state.dashboard_activo:
                 st.subheader("❌ Mantenimientos Programados NO Ejecutados")
                 df_tab4 = df_filtrado[df_filtrado['Estado_Supervision'] == 'Programado NO Ejecutado'].copy()
                 if not df_tab4.empty:
-                    columnas_tab4 = ['Empresa', 'Central/Ubicacion', 'Equipo', 'Sector', 'Tipo_Mantenimiento', 'Disponibilidad_Equipo', 'Inicio_Prog', 'Fin_Prog', 'Horas_Prog', 'MW_Indisponibles_Prog', 'Descripcion_Prog']
+                    columnas_tab4 = ['Fecha_Operacion', 'Empresa', 'Central/Ubicacion', 'Equipo', 'Sector', 'Tipo_Mantenimiento', 'Disponibilidad_Equipo', 'Inicio_Prog', 'Fin_Prog', 'Horas_Prog', 'MW_Indisponibles_Prog', 'Descripcion_Prog']
                     df_tab4_show = df_tab4[columnas_tab4].copy()
                     df_tab4_show.index = np.arange(1, len(df_tab4_show) + 1) 
                     st.dataframe(df_tab4_show, use_container_width=True)
@@ -447,4 +535,4 @@ if st.session_state.dashboard_activo:
                         st.info("Sin registros tras aplicar filtros.")
 
         else:
-            st.warning("No se pudieron obtener ambos archivos. Verifique que la fecha seleccionada ya tenga los reportes publicados.")
+            st.warning("No se pudieron extraer datos de los archivos del COES para el rango seleccionado.")
