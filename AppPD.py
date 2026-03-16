@@ -6,6 +6,7 @@ import urllib.parse
 import requests
 import zipfile
 import io
+import os
 import plotly.express as px
 import difflib
 import re
@@ -20,6 +21,25 @@ MESES = {
     5: "MAYO", 6: "JUNIO", 7: "JULIO", 8: "AGOSTO",
     9: "SETIEMBRE", 10: "OCTUBRE", 11: "NOVIEMBRE", 12: "DICIEMBRE"
 }
+
+# --- ARCHIVO DE PERSISTENCIA DE POTENCIAS ---
+ARCHIVO_POTENCIAS = "potencias_historicas.csv"
+
+def cargar_potencias_guardadas():
+    """Carga el histórico de potencias asignadas desde un archivo local."""
+    if os.path.exists(ARCHIVO_POTENCIAS):
+        return pd.read_csv(ARCHIVO_POTENCIAS)
+    return pd.DataFrame(columns=['Central/Ubicacion', 'Equipo', 'Potencia_Indisponible_MW'])
+
+def guardar_potencias_asignadas(df_nuevas):
+    """Actualiza y guarda el histórico de potencias."""
+    df_historico = cargar_potencias_guardadas()
+    if not df_historico.empty:
+        # Combinar y mantener la última actualización
+        df_final = pd.concat([df_nuevas, df_historico]).drop_duplicates(subset=['Central/Ubicacion', 'Equipo'], keep='first')
+    else:
+        df_final = df_nuevas
+    df_final.to_csv(ARCHIVO_POTENCIAS, index=False)
 
 def generar_urls_coes(fecha):
     año = fecha.strftime("%Y")
@@ -274,12 +294,14 @@ if st.session_state.dashboard_activo:
 
             st.markdown("---")
 
-            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            # --- AGREGADO PESTAÑA 6 ---
+            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
                 "📊 1. Resumen y Métricas",
                 "✅ 2. MATCH: Tiempos",
                 "⚠️ 3. Ejecutados NO Programados", 
                 "❌ 4. Programados NO Ejecutados",
-                "🗄️ 5. Datos Originales (Raw)"
+                "🗄️ 5. Datos Originales (Raw)",
+                "🔌 6. Potencia Indisponible (Gen F/S)"
             ])
             
             # --- PESTAÑA 1: RESUMEN EJECUTIVO ---
@@ -300,22 +322,18 @@ if st.session_state.dashboard_activo:
                 desviacion_neta = df_filtrado['Desviacion_Horas'].sum()
                 porcentaje_ejec_prog = (total_match / total_ejecutados * 100) if total_ejecutados > 0 else 0
                 
-                # 🔴 CÁLCULO DE LOS DATOS CRÍTICOS POR EMPRESA
                 texto_datos_criticos = ""
                 df_ejecutados_total = df_filtrado[df_filtrado['Estado_Supervision'].isin(['Programado y Ejecutado', 'Ejecutado NO Programado'])]
                 if not df_ejecutados_total.empty:
-                    # Empresa con mayor cantidad de registros
                     empresa_max_registros = df_ejecutados_total['Empresa'].value_counts().idxmax()
                     max_registros = df_ejecutados_total['Empresa'].value_counts().max()
                     
-                    # Empresa con mayor tiempo acumulado
                     df_empresa_horas = df_ejecutados_total.groupby('Empresa')['Horas_Ejec'].sum().reset_index()
                     empresa_max_horas = df_empresa_horas.loc[df_empresa_horas['Horas_Ejec'].idxmax(), 'Empresa']
                     max_horas = df_empresa_horas['Horas_Ejec'].max()
                     
                     texto_datos_criticos = f"\n\n🚨 *Datos Críticos:* La empresa que registró la mayor cantidad de intervenciones ejecutadas fue **{empresa_max_registros}** ({max_registros} maniobras). Asimismo, la empresa que acumuló el mayor tiempo operativo de mantenimiento fue **{empresa_max_horas}** con un total de **{max_horas:.2f} horas**."
 
-                # Resumen Ejecutivo 
                 texto_diagnostico = f"""
                 **📌 Resumen Ejecutivo de Operaciones:** En la ventana de supervisión, los documentos del COES reportaron un consolidado de **{total_prog_raw_count} mantenimientos programados** y **{total_ejec_raw_count} mantenimientos ejecutados** (bajo los filtros aplicados). 
                 Se determinó que el **{porcentaje_ejec_prog:.1f}% de los mantenimientos ejecutados fueron programados previamente**. 
@@ -323,10 +341,8 @@ if st.session_state.dashboard_activo:
                 """
                 st.info(texto_diagnostico)
                 
-                # 🔴 NOTA COMO TEXTO NORMAL (Fuera de la caja info)
                 st.markdown("*💡 **Nota sobre la Desviación Neta (Horas):*** Un valor **positivo (+)** indica un **retraso neto** en el sistema (las maniobras tomaron más tiempo del planificado), mientras que un valor **negativo (-)** indica un **ahorro operativo** (las unidades retornaron al servicio antes de lo previsto).")
                 
-                # SECCIÓN 1
                 st.markdown("#### 📑 1. Base Documental (Volumen Extraído del COES)")
                 st.caption("Volúmenes de registros extraídos directamente de los archivos del COES, ajustados a los filtros actuales.")
                 
@@ -335,7 +351,6 @@ if st.session_state.dashboard_activo:
                 c_doc2.metric("Mantenimientos Ejecutados", total_ejec_raw_count, help="Volumen del Anexo A (Programados/Ejecutados y Forzados).")
                 c_doc3.metric("Universo Total Único", total_universo, delta="Eventos unificados", delta_color="normal")
                 
-                # SECCIÓN 2
                 st.markdown("#### 🔍 2. Resultados de la Supervisión Operativa")
                 st.caption("Distribución exacta de los eventos y nivel de alineación operativa.")
                 
@@ -371,9 +386,6 @@ if st.session_state.dashboard_activo:
 
                 st.markdown("---")
                 
-                # ---------------------------------------------------------
-                # SECCIÓN 3: CRONOGRAMA GANTT OPERATIVO (DINÁMICO)
-                # ---------------------------------------------------------
                 st.markdown("#### 📅 3. Cronograma de Indisponibilidades Operativas (Gantt)")
                 st.caption("Visualización temporal de las Centrales y Unidades operadas. La gráfica se expande automáticamente para asegurar la legibilidad de todos los nombres.")
                 
@@ -412,15 +424,12 @@ if st.session_state.dashboard_activo:
 
                 st.markdown("---")
                 
-                # ---------------------------------------------------------
-                # SECCIÓN 4: ESTADÍSTICAS DE DURACIÓN Y EFICIENCIA
-                # ---------------------------------------------------------
                 st.markdown("#### ⏱️ 4. Análisis de Tiempos Exclusivo (Programado y Ejecutado)")
                 df_match_kpi = df_filtrado[df_filtrado['Estado_Supervision'] == 'Programado y Ejecutado'].copy()
                 
                 if not df_match_kpi.empty:
                     df_match_kpi['Desempeño_Tiempo'] = np.where(df_match_kpi['Desviacion_Horas'] > 0, 'Excedieron Programación (Retraso)', 
-                                                   np.where(df_match_kpi['Desviacion_Horas'] < 0, 'Terminaron Antes (Ahorro)', 'Ejecución Exacta'))
+                                                               np.where(df_match_kpi['Desviacion_Horas'] < 0, 'Terminaron Antes (Ahorro)', 'Ejecución Exacta'))
                     
                     col_t1, col_t2, col_t3, col_t4 = st.columns(4)
                     cant_mayor = len(df_match_kpi[df_match_kpi['Desviacion_Horas'] > 0])
@@ -455,9 +464,6 @@ if st.session_state.dashboard_activo:
                 
                 st.markdown("---")
                 
-                # ---------------------------------------------------------
-                # SECCIÓN 5: ESTADÍSTICAS POR TIPO DE MANTENIMIENTO
-                # ---------------------------------------------------------
                 st.markdown("#### 🛠️ 5. Estadísticas Operativas por Tipo de Mantenimiento")
                 col_tm1, col_tm2 = st.columns(2)
                 with col_tm1:
@@ -482,7 +488,7 @@ if st.session_state.dashboard_activo:
                 df_tab2 = df_filtrado[df_filtrado['Estado_Supervision'] == 'Programado y Ejecutado'].copy()
                 if not df_tab2.empty:
                     df_tab2['Estado_Tiempo'] = np.where(df_tab2['Desviacion_Horas'] > 0, '🔴 Mayor Tiempo', 
-                                               np.where(df_tab2['Desviacion_Horas'] < 0, '🟠 Menor Tiempo', '🟢 Tiempo Exacto'))
+                                                       np.where(df_tab2['Desviacion_Horas'] < 0, '🟠 Menor Tiempo', '🟢 Tiempo Exacto'))
                     columnas_tab2 = ['Fecha_Operacion', 'Estado_Tiempo', 'Empresa', 'Central/Ubicacion', 'Equipo', 'Sector', 'Tipo_Mantenimiento', 'Disponibilidad_Equipo', 
                                      'Inicio_Prog', 'Fin_Prog', 'Horas_Prog', 
                                      'Inicio_Ejec', 'Fin_Ejec', 'Horas_Ejec', 'Desviacion_Horas',
@@ -533,6 +539,81 @@ if st.session_state.dashboard_activo:
                         st.dataframe(df_ejec_raw_f, use_container_width=True)
                     else:
                         st.info("Sin registros tras aplicar filtros.")
+                        
+            # --- PESTAÑA 6: POTENCIA INDISPONIBLE (GENERACIÓN F/S) ---
+            with tab6:
+                st.subheader("🔌 Gestión de Potencia Indisponible - Generación (F/S)")
+                st.caption("Asignación y actualización de potencia indisponible para unidades de generación en mantenimiento ejecutado Fuera de Servicio (F/S). Los datos se guardarán de forma persistente.")
+
+                # Extraer un listado único de Centrales y Equipos que fueron EJECUTADOS en GENERACIÓN y F/S
+                df_gen_fs = df_filtrado[
+                    (df_filtrado['Sector'] == 'GENERACIÓN') &
+                    (df_filtrado['Disponibilidad_Equipo'] == 'F/S') &
+                    (df_filtrado['Estado_Supervision'].isin(['Programado y Ejecutado', 'Ejecutado NO Programado']))
+                ].copy()
+
+                if not df_gen_fs.empty:
+                    # Agrupar para tener combinaciones únicas de planta y equipo
+                    df_unidades = df_gen_fs[['Central/Ubicacion', 'Equipo']].drop_duplicates().reset_index(drop=True)
+                    
+                    # Recuperar datos históricos
+                    df_historico_pot = cargar_potencias_guardadas()
+                    
+                    # Hacer un merge left para mantener las unidades detectadas e inyectar el MW histórico si existe
+                    df_editor = pd.merge(df_unidades, df_historico_pot, on=['Central/Ubicacion', 'Equipo'], how='left')
+                    df_editor['Potencia_Indisponible_MW'] = df_editor['Potencia_Indisponible_MW'].fillna(0.0)
+
+                    st.markdown("#### 📝 Asignación de Potencia Indisponible")
+                    st.info("Edita la columna **'Potencia Indisponible (MW)'** y presiona guardar. Se actualizará la gráfica inferior de manera automática.")
+                    
+                    # Componente interactivo para edición en Streamlit
+                    df_editado = st.data_editor(
+                        df_editor,
+                        column_config={
+                            "Central/Ubicacion": st.column_config.TextColumn("Central de Generación", disabled=True),
+                            "Equipo": st.column_config.TextColumn("Unidad/Equipo F/S", disabled=True),
+                            "Potencia_Indisponible_MW": st.column_config.NumberColumn(
+                                "Potencia Indisponible (MW)", 
+                                min_value=0.0, 
+                                format="%.2f", 
+                                help="Ingresa la potencia en Megavatios."
+                            )
+                        },
+                        use_container_width=True,
+                        hide_index=True,
+                        key="editor_mw"
+                    )
+
+                    # Botón para persistir los cambios ingresados
+                    if st.button("💾 Guardar Potencias Asignadas", type="primary"):
+                        guardar_potencias_asignadas(df_editado)
+                        st.success("¡Valores almacenados con éxito en la base de datos local! Estarán disponibles en tus siguientes consultas de supervisión.")
+
+                    st.markdown("---")
+                    st.markdown("#### 📊 Impacto Operativo: Gráfica de Potencia Indisponible")
+                    
+                    # Filtrar unidades a graficar (solo las que tengan valor > 0)
+                    df_grafica_pot = df_editado[df_editado['Potencia_Indisponible_MW'] > 0].copy()
+                    
+                    if not df_grafica_pot.empty:
+                        df_grafica_pot['Unidad_Completa'] = df_grafica_pot['Central/Ubicacion'] + " - " + df_grafica_pot['Equipo']
+                        
+                        fig_potencia = px.bar(
+                            df_grafica_pot.sort_values(by='Potencia_Indisponible_MW', ascending=False),
+                            x='Unidad_Completa',
+                            y='Potencia_Indisponible_MW',
+                            title="Potencia Restada al SEIN por Unidades de Generación (F/S)",
+                            labels={'Unidad_Completa': 'Unidad de Generación', 'Potencia_Indisponible_MW': 'MW Indisponibles'},
+                            color='Potencia_Indisponible_MW',
+                            color_continuous_scale='Reds',
+                            text_auto='.2f'
+                        )
+                        fig_potencia.update_traces(textposition='outside')
+                        st.plotly_chart(fig_potencia, use_container_width=True)
+                    else:
+                        st.warning("No hay potencias mayores a 0 MW asignadas actualmente para visualizar la gráfica.")
+                else:
+                    st.info("Bajo los filtros actuales, no se registraron mantenimientos EJECUTADOS en GENERACIÓN bajo estado de indisponibilidad total (F/S).")
 
         else:
             st.warning("No se pudieron extraer datos de los archivos del COES para el rango seleccionado.")
