@@ -8,13 +8,11 @@ import zipfile
 import io
 import os
 import plotly.express as px
-import difflib
-import re
 
 # --- 1. CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="Supervisión SEIN - Osinergmin", layout="wide")
 st.title("⚡ Dashboard de Supervisión de Mantenimientos - SEIN")
-st.markdown("Supervisión COES: Mantenimientos Programado vs. Ejecutado")
+st.markdown("Supervisión COES: Mantenimientos Programado vs. Ejecutado + Resumen Operativo")
 
 MESES = {
     1: "ENERO", 2: "FEBRERO", 3: "MARZO", 4: "ABRIL",
@@ -22,24 +20,29 @@ MESES = {
     9: "SETIEMBRE", 10: "OCTUBRE", 11: "NOVIEMBRE", 12: "DICIEMBRE"
 }
 
-# --- ARCHIVO DE PERSISTENCIA DE POTENCIAS ---
-ARCHIVO_POTENCIAS = "potencias_historicas.csv"
+# --- ARCHIVOS DE PERSISTENCIA ---
+ARCHIVO_POTENCIAS_LOCAL = "potencias_historicas.csv"
+ARCHIVO_GITHUB_SEMILLA = "pOTENCIAS.csv" # Archivo del repositorio provisto
 
 def cargar_potencias_guardadas():
-    """Carga el histórico de potencias asignadas desde un archivo local."""
-    if os.path.exists(ARCHIVO_POTENCIAS):
-        return pd.read_csv(ARCHIVO_POTENCIAS)
-    return pd.DataFrame(columns=['Central/Ubicacion', 'Equipo', 'Potencia_Indisponible_MW'])
+    if os.path.exists(ARCHIVO_POTENCIAS_LOCAL):
+        df = pd.read_csv(ARCHIVO_POTENCIAS_LOCAL)
+    elif os.path.exists(ARCHIVO_GITHUB_SEMILLA):
+        df = pd.read_csv(ARCHIVO_GITHUB_SEMILLA)
+        if 'Empresa' not in df.columns:
+            df['Empresa'] = 'NO ESPECIFICADO'
+    else:
+        df = pd.DataFrame(columns=['Empresa', 'Central/Ubicacion', 'Equipo', 'Potencia_Indisponible_MW'])
+    
+    return df.drop_duplicates(subset=['Central/Ubicacion', 'Equipo'], keep='last')
 
 def guardar_potencias_asignadas(df_nuevas):
-    """Actualiza y guarda el histórico de potencias."""
     df_historico = cargar_potencias_guardadas()
     if not df_historico.empty:
-        # Combinar y mantener la última actualización
         df_final = pd.concat([df_nuevas, df_historico]).drop_duplicates(subset=['Central/Ubicacion', 'Equipo'], keep='first')
     else:
         df_final = df_nuevas
-    df_final.to_csv(ARCHIVO_POTENCIAS, index=False)
+    df_final.to_csv(ARCHIVO_POTENCIAS_LOCAL, index=False)
 
 def generar_urls_coes(fecha):
     año = fecha.strftime("%Y")
@@ -60,15 +63,29 @@ def generar_urls_coes(fecha):
     ]
     urls_ejec = [(f"https://www.coes.org.pe/portal/browser/download?url={urllib.parse.quote(path)}", skip) for path, skip in rutas_ejec_opciones]
     
-    return url_prog, urls_ejec
+    # URL de Costos Marginales
+    fecha_str_cmg = fecha.strftime("%Y%m%d")
+    path_cmg = f"Post Operación/Reportes/IEOD/{año}/{mes_num}_{mes_titulo}/{dia}/CMg{fecha_str_cmg}.zip"
+    url_cmg = f"https://www.coes.org.pe/portal/browser/download?url={urllib.parse.quote(path_cmg)}"
+    
+    return url_prog, urls_ejec, url_cmg
 
-# --- 2. EXTRACCIÓN Y LIMPIEZA ESPEJO (ETL) ---
+def col2idx(col_str):
+    """Convierte letras de columna Excel a índice base 0."""
+    expn = 0
+    col_num = 0
+    for char in reversed(col_str):
+        col_num += (ord(char.upper()) - ord('A') + 1) * (26 ** expn)
+        expn += 1
+    return col_num - 1
+
+# --- 2. EXTRACCIÓN Y LIMPIEZA ESPEJO (ETL UNIFICADO) ---
 @st.cache_data(show_spinner=False)
 def extraer_datos_coes(fecha):
-    url_prog, urls_ejec = generar_urls_coes(fecha)
+    url_prog, urls_ejec, url_cmg = generar_urls_coes(fecha)
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    df_prog, df_ejec = None, None
+    df_prog, df_ejec, df_rf, df_cmg = pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     columnas_estandar = ['Empresa', 'Ubicacion', 'Equipo', 'Inicio', 'Fin', 'Descripcion', 'MW_Indisponibles', 'Es_Programado', 'Disponibilidad_Equipo', 'Ocasiona_Interrupciones', 'Tipo_Mantenimiento', 'Codigo_Equipo', 'Tipo_Equipo']
     
     # 2.1 EXTRACCIÓN DEL PROGRAMADO
@@ -99,10 +116,10 @@ def extraer_datos_coes(fecha):
                         df_prog = pd.read_excel(archivo_excel_prog, sheet_name=hoja_prog, skiprows=8, usecols="B:N", names=columnas_estandar)
                         df_prog = df_prog.dropna(subset=['Empresa', 'Equipo'], how='all')
                         df_prog = df_prog[~df_prog['Empresa'].astype(str).str.contains('TOTAL|NOTA|ELABORADO|FUENTE', case=False, na=False)]
-    except Exception as e:
-        pass # Silenciamos errores por día para que el rango no colapse
+    except Exception:
+        pass 
 
-    # 2.2 EXTRACCIÓN DEL EJECUTADO
+    # 2.2 EXTRACCIÓN DEL EJECUTADO Y RESERVA FRÍA
     exito_ejecutado = False
     for url_ejec, skiprows_val in urls_ejec:
         if exito_ejecutado: break
@@ -121,14 +138,125 @@ def extraer_datos_coes(fecha):
                     df_ejec = df_ejec.dropna(subset=['Empresa', 'Equipo'], how='all')
                     df_ejec = df_ejec[~df_ejec['Empresa'].astype(str).str.contains('TOTAL|NOTA|ELABORADO|FUENTE', case=False, na=False)]
                     exito_ejecutado = True
+                    
+                # Extracción anidada de Reserva Fría
+                hojas_limpias = {h.strip().upper(): h for h in sheet_names_ejec}
+                nombres_posibles_rf = [h for h in hojas_limpias.keys() if "RESERVA" in h and "FR" in h]
+                if nombres_posibles_rf:
+                    hoja_rf = hojas_limpias[nombres_posibles_rf[0]]
+                    df_raw_rf = pd.read_excel(archivo_excel, sheet_name=hoja_rf, header=None)
+                    
+                    codigos_restriccion = [239, 263, 265, 240, 241, 242, 924, 926, 786, 787, 788, 789, 995, 996, 997, 758, 42667, 42688, 756, 156]
+                    codigos_nodo = [240, 241, 242, 995, 996, 997, 926, 924, 786, 787, 788, 789, 239, 263, 265]
+                    
+                    col_rf = None
+                    cols_restriccion = []
+                    cols_nodo = []
+                    fila_lista = []
+                    
+                    for idx_fila in range(3, 7): 
+                        fila_vals = df_raw_rf.iloc[idx_fila].values
+                        if 7000 in fila_vals:
+                            fila_lista = list(fila_vals)
+                            col_rf = fila_lista.index(7000)
+                            for cod in codigos_restriccion:
+                                if cod in fila_lista: cols_restriccion.append(fila_lista.index(cod))
+                            for cod in codigos_nodo:
+                                if cod in fila_lista: cols_nodo.append(fila_lista.index(cod))
+                            break
+                    
+                    if col_rf is not None:
+                        data_rf = df_raw_rf.iloc[6:54, col_rf].values
+                        reserva_fria_series = pd.to_numeric(pd.Series(data_rf), errors='coerce').fillna(0)
+                        
+                        reglas_cc = [
+                            {'tv': 56677, 'tgs': [209]}, {'tv': 250, 'tgs': [252, 249]},
+                            {'tv': 236, 'tgs': [194, 196, 207]}, {'tv': 285, 'tgs': [795]},
+                            {'tv': 193, 'tgs': [113, 114]}, {'tv': 2159, 'tgs': [248]}
+                        ]
+                        for regla in reglas_cc:
+                            tv_cod = regla['tv']
+                            tgs_cods = regla['tgs']
+                            if tv_cod in fila_lista:
+                                idx_tv = fila_lista.index(tv_cod)
+                                tv_series = pd.to_numeric(pd.Series(df_raw_rf.iloc[6:54, idx_tv].values), errors='coerce').fillna(0)
+                                sum_tgs = pd.Series(np.zeros(48))
+                                for tg in tgs_cods:
+                                    if tg in fila_lista:
+                                        idx_tg = fila_lista.index(tg)
+                                        tg_series = pd.to_numeric(pd.Series(df_raw_rf.iloc[6:54, idx_tg].values), errors='coerce').fillna(0)
+                                        sum_tgs += tg_series
+                                reserva_fria_series = pd.Series(np.where(sum_tgs <= 0, reserva_fria_series - tv_series, reserva_fria_series))
+                        
+                        reserva_fria_series = reserva_fria_series.clip(lower=0) 
+                        
+                        restriccion_total = pd.Series(np.zeros(48))
+                        for col_idx in cols_restriccion:
+                            data_res = df_raw_rf.iloc[6:54, col_idx].values
+                            restriccion_total += pd.to_numeric(pd.Series(data_res), errors='coerce').fillna(0)
+                            
+                        reserva_eficiente_series = reserva_fria_series - restriccion_total
+                        reserva_eficiente_series = reserva_eficiente_series.clip(lower=0) 
+                        
+                        reserva_nodo_series = pd.Series(np.zeros(48))
+                        for col_idx in cols_nodo:
+                            data_nodo = df_raw_rf.iloc[6:54, col_idx].values
+                            reserva_nodo_series += pd.to_numeric(pd.Series(data_nodo), errors='coerce').fillna(0)
+                        
+                        dt_fecha = datetime.combine(fecha, datetime.min.time())
+                        fechas_horas = [dt_fecha + timedelta(minutes=30 * (i + 1)) for i in range(48)]
+                        
+                        df_rf = pd.DataFrame({
+                            'FECHA_HORA': fechas_horas,
+                            'RESERVA_FRIA_MW': reserva_fria_series,
+                            'RESERVA_EFICIENTE_MW': reserva_eficiente_series,
+                            'RESERVA_NODO_MW': reserva_nodo_series
+                        })
+
         except Exception:
             continue
 
-    return df_prog, df_ejec
+    # 2.3 EXTRACCIÓN DE COSTOS MARGINALES
+    try:
+        res_cmg = requests.get(url_cmg, headers=headers, timeout=20)
+        if res_cmg.status_code == 200 and b"html" not in res_cmg.content[:100].lower():
+            with zipfile.ZipFile(io.BytesIO(res_cmg.content)) as z:
+                target_file = None
+                for fname in z.namelist():
+                    if "CMgCP" in fname and fname.endswith((".xlsx", ".xls")):
+                        target_file = fname
+                        break
+                if target_file:
+                    with z.open(target_file) as f:
+                        file_bytes = io.BytesIO(f.read())
+                        engine = 'openpyxl' if target_file.endswith('.xlsx') else None
+                        df_raw_cmg = pd.read_excel(file_bytes, header=None, engine=engine)
+                        
+                        idx_sr = col2idx('GV')  # SANTA ROSA 220
+                        idx_ta = col2idx('HH')  # TALARA 220
+                        idx_mo = col2idx('EP')  # MOQUEGUA 220
+                        
+                        val_sr = pd.to_numeric(df_raw_cmg.iloc[3:51, idx_sr], errors='coerce').values
+                        val_ta = pd.to_numeric(df_raw_cmg.iloc[3:51, idx_ta], errors='coerce').values
+                        val_mo = pd.to_numeric(df_raw_cmg.iloc[3:51, idx_mo], errors='coerce').values
+                        
+                        dt_fecha = datetime.combine(fecha, datetime.min.time())
+                        fechas_horas = [dt_fecha + timedelta(minutes=30 * (i + 1)) for i in range(48)]
+                        
+                        df_cmg_tmp = pd.DataFrame({
+                            'FECHA_HORA': fechas_horas,
+                            'SANTA ROSA 220': val_sr,
+                            'TALARA 220': val_ta,
+                            'MOQUEGUA 220': val_mo
+                        })
+                        df_cmg = df_cmg_tmp.melt(id_vars=['FECHA_HORA'], var_name='NODO', value_name='COSTO_MARGINAL_SOLES')
+    except Exception:
+        pass
+
+    return df_prog, df_ejec, df_rf, df_cmg
 
 def obtener_datos_rango(fecha_inicio, fecha_fin):
-    dfs_prog = []
-    dfs_ejec = []
+    dfs_prog, dfs_ejec, dfs_rf, dfs_cmg = [], [], [], []
     rango_dias = pd.date_range(fecha_inicio, fecha_fin)
     total_dias = len(rango_dias)
     
@@ -136,8 +264,8 @@ def obtener_datos_rango(fecha_inicio, fecha_fin):
     texto_progreso = st.empty()
     
     for i, d in enumerate(rango_dias):
-        texto_progreso.text(f"⏳ Descargando y procesando IEOD del {d.strftime('%d/%m/%Y')} ({i+1}/{total_dias})...")
-        df_p, df_e = extraer_datos_coes(d)
+        texto_progreso.text(f"⏳ Extrayendo Despachos, Reservas y CMg del {d.strftime('%d/%m/%Y')} ({i+1}/{total_dias})...")
+        df_p, df_e, df_r, df_c = extraer_datos_coes(d)
         
         if df_p is not None and not df_p.empty:
             df_p.insert(0, 'Fecha_Operacion', d.date())
@@ -145,6 +273,10 @@ def obtener_datos_rango(fecha_inicio, fecha_fin):
         if df_e is not None and not df_e.empty:
             df_e.insert(0, 'Fecha_Operacion', d.date())
             dfs_ejec.append(df_e)
+        if df_r is not None and not df_r.empty:
+            dfs_rf.append(df_r)
+        if df_c is not None and not df_c.empty:
+            dfs_cmg.append(df_c)
             
         barra_progreso.progress((i + 1) / total_dias)
     
@@ -153,7 +285,10 @@ def obtener_datos_rango(fecha_inicio, fecha_fin):
         
     df_prog_final = pd.concat(dfs_prog, ignore_index=True) if dfs_prog else pd.DataFrame()
     df_ejec_final = pd.concat(dfs_ejec, ignore_index=True) if dfs_ejec else pd.DataFrame()
-    return df_prog_final, df_ejec_final
+    df_rf_final = pd.concat(dfs_rf, ignore_index=True) if dfs_rf else pd.DataFrame()
+    df_cmg_final = pd.concat(dfs_cmg, ignore_index=True) if dfs_cmg else pd.DataFrame()
+    
+    return df_prog_final, df_ejec_final, df_rf_final, df_cmg_final
 
 # --- 3. FUNCIONES GLOBALES DE NORMALIZACIÓN ---
 def normalizar_texto(serie):
@@ -170,6 +305,11 @@ def determinar_sector(row):
 
 # --- 4. MOTOR DE CONCILIACIÓN ---
 def conciliar_datos(df_prog, df_ejec):
+    if not df_prog.empty:
+        df_prog = df_prog.drop_duplicates(subset=['Fecha_Operacion', 'Empresa', 'Ubicacion', 'Equipo', 'Inicio', 'Fin'])
+    if not df_ejec.empty:
+        df_ejec = df_ejec.drop_duplicates(subset=['Fecha_Operacion', 'Empresa', 'Ubicacion', 'Equipo', 'Inicio', 'Fin'])
+
     for df in [df_prog, df_ejec]:
         if not df.empty:
             df['Empresa'] = normalizar_texto(df['Empresa'])
@@ -235,35 +375,37 @@ if st.sidebar.button("Procesar Información"):
 
 if st.session_state.dashboard_activo:
     with st.spinner("Compilando bases de datos y sincronizando métricas operativas..."):
-        df_prog_raw, df_ejec_raw = obtener_datos_rango(fecha_inicio, fecha_fin)
+        df_prog_raw, df_ejec_raw, df_rf_raw, df_cmg_raw = obtener_datos_rango(fecha_inicio, fecha_fin)
         
         if not df_prog_raw.empty or not df_ejec_raw.empty:
             df_conciliado = conciliar_datos(df_prog_raw.copy(), df_ejec_raw.copy())
             
             st.markdown("### 🎛️ Filtros Dinámicos")
-            col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+            col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns(5)
             
             empresas_disp = sorted(df_conciliado[df_conciliado['Empresa'] != 'NAN']['Empresa'].dropna().unique())
             empresa_sel = col_f1.multiselect("Empresa Concesionaria:", empresas_disp, default=[])
             
+            centrales_disp = sorted(df_conciliado[df_conciliado['Central/Ubicacion'] != '-']['Central/Ubicacion'].dropna().unique())
+            central_sel = col_f2.multiselect("Central / Ubicación:", centrales_disp, default=[])
+            
             sectores_disp = sorted(df_conciliado['Sector'].unique())
             default_sector = ['GENERACIÓN'] if 'GENERACIÓN' in sectores_disp else []
-            sector_sel = col_f2.multiselect("Sector (Gen/Trans):", sectores_disp, default=default_sector)
+            sector_sel = col_f3.multiselect("Sector (Gen/Trans):", sectores_disp, default=default_sector)
             
             disp_equipos = sorted(df_conciliado[df_conciliado['Disponibilidad_Equipo'] != 'NAN']['Disponibilidad_Equipo'].unique())
-            disp_sel = col_f3.multiselect("Estado (E/S o F/S):", disp_equipos, default=disp_equipos)
+            disp_sel = col_f4.multiselect("Estado (E/S o F/S):", disp_equipos, default=disp_equipos)
             
             tipos_disp = sorted(df_conciliado[df_conciliado['Tipo_Mantenimiento'] != 'NO ESPECIFICADO']['Tipo_Mantenimiento'].unique())
-            tipo_sel = col_f4.multiselect("Tipo de Mantenimiento:", tipos_disp, default=[])
+            tipo_sel = col_f5.multiselect("Tipo de Mantenimiento:", tipos_disp, default=[])
             
-            # APLICACIÓN DE FILTROS AL UNIVERSO CONCILIADO
             df_filtrado = df_conciliado.copy()
             if len(empresa_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Empresa'].isin(empresa_sel)]
+            if len(central_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Central/Ubicacion'].isin(central_sel)]
             if len(sector_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Sector'].isin(sector_sel)]
             if len(disp_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Disponibilidad_Equipo'].isin(disp_sel)]
             if len(tipo_sel) > 0: df_filtrado = df_filtrado[df_filtrado['Tipo_Mantenimiento'].isin(tipo_sel)]
 
-            # APLICACIÓN DE FILTROS A LA BASE DOCUMENTAL RAW
             df_prog_raw_f = df_prog_raw.copy()
             if not df_prog_raw_f.empty:
                 df_prog_raw_f['Empresa_Norm'] = normalizar_texto(df_prog_raw_f['Empresa'])
@@ -343,16 +485,10 @@ if st.session_state.dashboard_activo:
                 
                 st.markdown("*💡 **Nota sobre la Desviación Neta (Horas):*** Un valor **positivo (+)** indica un **retraso neto** en el sistema (las maniobras tomaron más tiempo del planificado), mientras que un valor **negativo (-)** indica un **ahorro operativo** (las unidades retornaron al servicio antes de lo previsto).")
                 
-                st.markdown("#### 📑 1. Base Documental (Volumen Extraído del COES)")
-                st.caption("Volúmenes de registros extraídos directamente de los archivos del COES, ajustados a los filtros actuales.")
-                
                 c_doc1, c_doc2, c_doc3 = st.columns(3)
                 c_doc1.metric("Mantenimientos Programados", total_prog_raw_count, help="Volumen del Anexo Osinergmin (Programados y Cancelados).")
                 c_doc2.metric("Mantenimientos Ejecutados", total_ejec_raw_count, help="Volumen del Anexo A (Programados/Ejecutados y Forzados).")
                 c_doc3.metric("Universo Total Único", total_universo, delta="Eventos unificados", delta_color="normal")
-                
-                st.markdown("#### 🔍 2. Resultados de la Supervisión Operativa")
-                st.caption("Distribución exacta de los eventos y nivel de alineación operativa.")
                 
                 c_res1, c_res2, c_res3, c_res4 = st.columns(4)
                 c_res1.metric("Programado y Ejecutado", total_match, help="Cumplieron con planificar y ejecutar.")
@@ -387,7 +523,6 @@ if st.session_state.dashboard_activo:
                 st.markdown("---")
                 
                 st.markdown("#### 📅 3. Cronograma de Indisponibilidades Operativas (Gantt)")
-                st.caption("Visualización temporal de las Centrales y Unidades operadas. La gráfica se expande automáticamente para asegurar la legibilidad de todos los nombres.")
                 
                 df_gantt = df_filtrado[df_filtrado['Estado_Supervision'].isin(['Programado y Ejecutado', 'Ejecutado NO Programado'])].copy()
                 
@@ -398,7 +533,6 @@ if st.session_state.dashboard_activo:
                     
                     if not df_gantt.empty:
                         df_gantt['Central_Unidad'] = df_gantt['Central/Ubicacion'] + " | " + df_gantt['Equipo']
-                        
                         num_y_items = len(df_gantt['Central_Unidad'].unique())
                         altura_dinamica = max(400, num_y_items * 35) 
                         
@@ -540,12 +674,11 @@ if st.session_state.dashboard_activo:
                     else:
                         st.info("Sin registros tras aplicar filtros.")
                         
-            # --- PESTAÑA 6: POTENCIA INDISPONIBLE (GENERACIÓN F/S) ---
+            # --- PESTAÑA 6: POTENCIA INDISPONIBLE, RESERVA Y CMg ---
             with tab6:
                 st.subheader("🔌 Gestión de Potencia Indisponible - Generación (F/S)")
-                st.caption("Asignación y actualización de potencia indisponible para unidades de generación en mantenimiento ejecutado Fuera de Servicio (F/S). Los datos se guardarán de forma persistente.")
+                st.caption("Módulo de asignación para la Potencia Restada al SEIN. La base se autocompleta con el repositorio histórico de Osinergmin.")
 
-                # Extraer un listado único de Centrales y Equipos que fueron EJECUTADOS en GENERACIÓN y F/S
                 df_gen_fs = df_filtrado[
                     (df_filtrado['Sector'] == 'GENERACIÓN') &
                     (df_filtrado['Disponibilidad_Equipo'] == 'F/S') &
@@ -553,67 +686,318 @@ if st.session_state.dashboard_activo:
                 ].copy()
 
                 if not df_gen_fs.empty:
-                    # Agrupar para tener combinaciones únicas de planta y equipo
-                    df_unidades = df_gen_fs[['Central/Ubicacion', 'Equipo']].drop_duplicates().reset_index(drop=True)
-                    
-                    # Recuperar datos históricos
+                    df_unidades = df_gen_fs[['Empresa', 'Central/Ubicacion', 'Equipo']].drop_duplicates().reset_index(drop=True)
                     df_historico_pot = cargar_potencias_guardadas()
-                    
-                    # Hacer un merge left para mantener las unidades detectadas e inyectar el MW histórico si existe
-                    df_editor = pd.merge(df_unidades, df_historico_pot, on=['Central/Ubicacion', 'Equipo'], how='left')
+                    df_editor = pd.merge(df_unidades, df_historico_pot[['Central/Ubicacion', 'Equipo', 'Potencia_Indisponible_MW']], on=['Central/Ubicacion', 'Equipo'], how='left')
                     df_editor['Potencia_Indisponible_MW'] = df_editor['Potencia_Indisponible_MW'].fillna(0.0)
 
                     st.markdown("#### 📝 Asignación de Potencia Indisponible")
-                    st.info("Edita la columna **'Potencia Indisponible (MW)'** y presiona guardar. Se actualizará la gráfica inferior de manera automática.")
-                    
-                    # Componente interactivo para edición en Streamlit
                     df_editado = st.data_editor(
                         df_editor,
                         column_config={
+                            "Empresa": st.column_config.TextColumn("Empresa Concesionaria", disabled=True),
                             "Central/Ubicacion": st.column_config.TextColumn("Central de Generación", disabled=True),
                             "Equipo": st.column_config.TextColumn("Unidad/Equipo F/S", disabled=True),
                             "Potencia_Indisponible_MW": st.column_config.NumberColumn(
-                                "Potencia Indisponible (MW)", 
-                                min_value=0.0, 
-                                format="%.2f", 
-                                help="Ingresa la potencia en Megavatios."
+                                "Potencia Indisponible (MW)", min_value=0.0, format="%.2f"
                             )
                         },
-                        use_container_width=True,
-                        hide_index=True,
-                        key="editor_mw"
+                        use_container_width=True, hide_index=True, key="editor_mw"
                     )
 
-                    # Botón para persistir los cambios ingresados
-                    if st.button("💾 Guardar Potencias Asignadas", type="primary"):
+                    if st.button("💾 Guardar Potencias Asignadas al Repositorio", type="primary"):
                         guardar_potencias_asignadas(df_editado)
-                        st.success("¡Valores almacenados con éxito en la base de datos local! Estarán disponibles en tus siguientes consultas de supervisión.")
+                        st.success("¡Valores almacenados en el búfer con éxito!")
 
                     st.markdown("---")
-                    st.markdown("#### 📊 Impacto Operativo: Gráfica de Potencia Indisponible")
+                    st.markdown("#### 📈 Impacto Operativo y Perfil de Indisponibilidad")
                     
-                    # Filtrar unidades a graficar (solo las que tengan valor > 0)
-                    df_grafica_pot = df_editado[df_editado['Potencia_Indisponible_MW'] > 0].copy()
+                    df_grafica_base = pd.merge(df_gen_fs[['Empresa', 'Central/Ubicacion', 'Equipo', 'Inicio_Ejec', 'Fin_Ejec', 'Horas_Ejec']], 
+                                          df_editado, on=['Empresa', 'Central/Ubicacion', 'Equipo'], how='inner')
                     
-                    if not df_grafica_pot.empty:
-                        df_grafica_pot['Unidad_Completa'] = df_grafica_pot['Central/Ubicacion'] + " - " + df_grafica_pot['Equipo']
+                    if not df_grafica_base.empty and df_grafica_base['Potencia_Indisponible_MW'].sum() > 0:
+                        col_filt_1, col_filt_2 = st.columns(2)
+                        empresas_graf = sorted(df_grafica_base['Empresa'].unique())
+                        empresa_graf_sel = col_filt_1.multiselect("Filtrar Análisis por Empresa:", empresas_graf, default=[], key="flt_empresa_impacto")
                         
-                        fig_potencia = px.bar(
-                            df_grafica_pot.sort_values(by='Potencia_Indisponible_MW', ascending=False),
-                            x='Unidad_Completa',
-                            y='Potencia_Indisponible_MW',
-                            title="Potencia Restada al SEIN por Unidades de Generación (F/S)",
-                            labels={'Unidad_Completa': 'Unidad de Generación', 'Potencia_Indisponible_MW': 'MW Indisponibles'},
-                            color='Potencia_Indisponible_MW',
-                            color_continuous_scale='Reds',
-                            text_auto='.2f'
-                        )
-                        fig_potencia.update_traces(textposition='outside')
-                        st.plotly_chart(fig_potencia, use_container_width=True)
-                    else:
-                        st.warning("No hay potencias mayores a 0 MW asignadas actualmente para visualizar la gráfica.")
+                        if empresa_graf_sel:
+                            centrales_graf = sorted(df_grafica_base[df_grafica_base['Empresa'].isin(empresa_graf_sel)]['Central/Ubicacion'].unique())
+                        else:
+                            centrales_graf = sorted(df_grafica_base['Central/Ubicacion'].unique())
+                            
+                        central_graf_sel = col_filt_2.multiselect("Filtrar Análisis por Central/Ubicación:", centrales_graf, default=[], key="flt_central_impacto")
+                        
+                        df_grafica = df_grafica_base.copy()
+                        if empresa_graf_sel: df_grafica = df_grafica[df_grafica['Empresa'].isin(empresa_graf_sel)]
+                        if central_graf_sel: df_grafica = df_grafica[df_grafica['Central/Ubicacion'].isin(central_graf_sel)]
+                        
+                        if not df_grafica.empty:
+                            df_grafica['Inicio_DT'] = pd.to_datetime(df_grafica['Inicio_Ejec'], format='%d/%m/%Y %H:%M', errors='coerce')
+                            df_grafica['Fin_DT'] = pd.to_datetime(df_grafica['Fin_Ejec'], format='%d/%m/%Y %H:%M', errors='coerce')
+                            df_grafica = df_grafica.dropna(subset=['Inicio_DT', 'Fin_DT'])
+                            df_grafica['Central_Equipo'] = df_grafica['Central/Ubicacion'] + " - " + df_grafica['Equipo']
+                            
+                            if not df_grafica.empty:
+                                min_dt = df_grafica['Inicio_DT'].min()
+                                max_dt = df_grafica['Fin_DT'].max()
+                                
+                                if min_dt < max_dt:
+                                    time_grid = pd.date_range(start=min_dt, end=max_dt, freq='h')
+                                    series_list, series_detail_list, series_eq_list = [], [], []
+                                    
+                                    centrales_involucradas = df_grafica['Central/Ubicacion'].unique()
+                                    equipos_involucrados = df_grafica['Central_Equipo'].unique()
+                                    
+                                    for t in time_grid:
+                                        mask = (df_grafica['Inicio_DT'] <= t) & (df_grafica['Fin_DT'] > t)
+                                        df_t = df_grafica.loc[mask]
+                                        df_t_unique = df_t.drop_duplicates(subset=['Central_Equipo'])
+                                        
+                                        centrales_completas = df_t_unique[df_t_unique['Equipo'] == 'CENTRAL'][['Empresa', 'Central/Ubicacion']].drop_duplicates()
+                                        for _, row in centrales_completas.iterrows():
+                                            condicion_remover = (df_t_unique['Empresa'] == row['Empresa']) & (df_t_unique['Central/Ubicacion'] == row['Central/Ubicacion']) & (df_t_unique['Equipo'] != 'CENTRAL')
+                                            df_t_unique = df_t_unique[~condicion_remover]
+                                        
+                                        mw_sum = df_t_unique['Potencia_Indisponible_MW'].sum()
+                                        series_list.append({'Fecha_Hora': t, 'MW_Total_Indisponible': mw_sum})
+                                        
+                                        agg_central = df_t_unique.groupby('Central/Ubicacion')['Potencia_Indisponible_MW'].sum()
+                                        for c in centrales_involucradas:
+                                            series_detail_list.append({
+                                                'Fecha_Hora': t, 'Central': c, 'MW_Indisponible': agg_central.get(c, 0.0), 'MW_Total_Sistema': mw_sum
+                                            })
+                                            
+                                        agg_eq = df_t_unique.groupby('Central_Equipo')['Potencia_Indisponible_MW'].sum()
+                                        for eq in equipos_involucrados:
+                                            series_eq_list.append({
+                                                'Fecha_Hora': t, 'Central_Equipo': eq, 'MW_Indisponible': agg_eq.get(eq, 0.0), 'MW_Total_Sistema': mw_sum
+                                            })
+                                    
+                                    df_area = pd.DataFrame(series_list)
+                                    df_area_detail = pd.DataFrame(series_detail_list)
+                                    df_area_eq = pd.DataFrame(series_eq_list)
+                                    
+                                    max_potencia_aislada = df_grafica['Potencia_Indisponible_MW'].max()
+                                    energia_ns_total = df_area['MW_Total_Indisponible'].sum()
+                                    unidades_afectadas = len(df_grafica[df_grafica['Potencia_Indisponible_MW'] > 0]['Central_Equipo'].unique())
+                                    
+                                    col_st1, col_st2, col_st3 = st.columns(3)
+                                    col_st1.metric("Máxima Potencia Unitaria F/S", f"{max_potencia_aislada:.2f} MW")
+                                    col_st2.metric("Equipos en Indisponibilidad", f"{unidades_afectadas} unidades")
+                                    col_st3.metric("Energía No Suministrada (Est.)", f"{energia_ns_total:,.2f} MWh")
+
+                                    colores_solidos_centrales = px.colors.qualitative.Vivid + px.colors.qualitative.Dark24
+                                    colores_solidos_equipos = px.colors.qualitative.Alphabet + px.colors.qualitative.Dark24 + px.colors.qualitative.Set1
+                                    
+                                    fig_area = px.area(df_area, x='Fecha_Hora', y='MW_Total_Indisponible', 
+                                                       title="Perfil Evolutivo de Potencia Indisponible Global (MW) del SEIN",
+                                                       color_discrete_sequence=['#d62728'])
+                                    fig_area.update_xaxes(tickmode='linear', dtick=86400000, tickformat="%d/%m/%Y", title_text="Fecha de Operación")
+                                    fig_area.update_yaxes(title_text="Demanda Indisponible (MW)")
+                                    fig_area.update_traces(line=dict(width=0), hovertemplate="<b>%{y:,.2f} MW</b>")
+                                    st.plotly_chart(fig_area, use_container_width=True)
+                                    
+                                    fig_area_detail = px.area(df_area_detail, x='Fecha_Hora', y='MW_Indisponible', color='Central',
+                                                       title="Desglose de Potencia Indisponible (MW) por Central de Generación",
+                                                       color_discrete_sequence=colores_solidos_centrales,
+                                                       hover_data={'Fecha_Hora': '|%d/%m/%Y %H:%M', 'MW_Indisponible': ':.2f', 'MW_Total_Sistema': ':.2f'})
+                                    fig_area_detail.update_xaxes(tickmode='linear', dtick=86400000, tickformat="%d/%m/%Y", title_text="Fecha de Operación")
+                                    fig_area_detail.update_yaxes(title_text="Demanda Indisponible (MW)")
+                                    fig_area_detail.update_traces(line=dict(width=0))
+                                    st.plotly_chart(fig_area_detail, use_container_width=True)
+                                    
+                                    fig_area_eq = px.area(df_area_eq, x='Fecha_Hora', y='MW_Indisponible', color='Central_Equipo',
+                                                       title="Desglose Extendido de Potencia Indisponible (MW) por Unidad/Equipo",
+                                                       color_discrete_sequence=colores_solidos_equipos,
+                                                       hover_data={'Fecha_Hora': '|%d/%m/%Y %H:%M', 'MW_Indisponible': ':.2f', 'MW_Total_Sistema': ':.2f'})
+                                    fig_area_eq.update_xaxes(tickmode='linear', dtick=86400000, tickformat="%d/%m/%Y", title_text="Fecha de Operación")
+                                    fig_area_eq.update_yaxes(title_text="Demanda Indisponible (MW)")
+                                    fig_area_eq.update_traces(line=dict(width=0))
+                                    st.plotly_chart(fig_area_eq, use_container_width=True)
+
+                                    st.markdown("#### 🗃️ Base de Datos Analítica: Perfil de Indisponibilidad")
+                                    df_pivot = df_area_detail.pivot(index='Fecha_Hora', columns='Central', values='MW_Indisponible').reset_index()
+                                    df_pivot['Total_SEIN (MW)'] = df_pivot.drop(columns=['Fecha_Hora']).sum(axis=1)
+                                    df_pivot['Fecha_Hora'] = df_pivot['Fecha_Hora'].dt.strftime('%d/%m/%Y %H:%M')
+                                    st.dataframe(df_pivot, use_container_width=True)
+                                else:
+                                    st.info("El intervalo de tiempo es demasiado estrecho para construir el área continua.")
+                        else:
+                            st.info("Los filtros aplicados no arrojaron resultados para graficar el perfil.")
                 else:
-                    st.info("Bajo los filtros actuales, no se registraron mantenimientos EJECUTADOS en GENERACIÓN bajo estado de indisponibilidad total (F/S).")
+                    st.info("No se registraron maniobras EJECUTADAS en el sector GENERACIÓN con un estado operativo Fuera de Servicio (F/S).")
+
+                # ========================================================
+                # INYECCIÓN DE SECCIÓN: RESERVA FRÍA Y EFICIENTE
+                # ========================================================
+                st.markdown("---")
+                st.markdown("### ❄️ Fiscalización de Reserva Operativa del SEIN")
+                
+                if df_rf_raw is None or df_rf_raw.empty:
+                    st.warning("⚠️ No se encontró información de Reserva Fría para las fechas seleccionadas.")
+                else:
+                    df_rf = df_rf_raw.copy()
+                    fecha_min_rf = df_rf['FECHA_HORA'].min()
+                    fecha_max_rf = df_rf['FECHA_HORA'].max()
+                    
+                    st.markdown("#### 1. Disponibilidad de Reserva Fría Total (Ajustada por TV/TG)")
+                    limite_superior_rf = df_rf['RESERVA_FRIA_MW'].max() * 1.10
+
+                    fig_rf = px.area(
+                        df_rf, x="FECHA_HORA", y="RESERVA_FRIA_MW", 
+                        title="Curva de Reserva Fría Total (MW)",
+                        color_discrete_sequence=["#00BFFF"] 
+                    )
+                    fig_rf.update_traces(hovertemplate="<b>%{y:,.2f} MW</b>", line=dict(width=0))
+                    fig_rf.update_layout(
+                        hovermode="x unified",
+                        xaxis=dict(tickformat="%d/%m\n%H:%M", title="Fecha Operativa", range=[fecha_min_rf, fecha_max_rf], tickmode="linear", dtick=86400000),
+                        yaxis=dict(title="Reserva Total (MW)", range=[0, limite_superior_rf]),
+                        height=350, margin=dict(t=30, b=40, l=50, r=20)
+                    )
+                    st.plotly_chart(fig_rf, use_container_width=True)
+                    
+                    col_rf1, col_rf2, col_rf3 = st.columns(3)
+                    col_rf1.metric("Promedio - Reserva Fría", f"{df_rf['RESERVA_FRIA_MW'].mean():.2f} MW")
+                    col_rf2.metric("Máxima - Reserva Fría", f"{df_rf['RESERVA_FRIA_MW'].max():.2f} MW")
+                    col_rf3.metric("Mínima - Reserva Fría", f"{df_rf['RESERVA_FRIA_MW'].min():.2f} MW")
+                    
+                    st.markdown("---")
+
+                    st.markdown("#### 2. Disponibilidad de Reserva Eficiente (Descontando Restricciones)")
+                    limite_superior_ef = df_rf['RESERVA_EFICIENTE_MW'].max() * 1.10
+
+                    fig_ef = px.area(
+                        df_rf, x="FECHA_HORA", y="RESERVA_EFICIENTE_MW", 
+                        title="Curva de Reserva Eficiente (MW)",
+                        color_discrete_sequence=["#32CD32"]
+                    )
+                    fig_ef.update_traces(hovertemplate="<b>%{y:,.2f} MW</b>", line=dict(width=0))
+                    fig_ef.update_layout(
+                        hovermode="x unified",
+                        xaxis=dict(tickformat="%d/%m\n%H:%M", title="Fecha Operativa", range=[fecha_min_rf, fecha_max_rf], tickmode="linear", dtick=86400000),
+                        yaxis=dict(title="Reserva Eficiente (MW)", range=[0, limite_superior_ef]),
+                        height=350, margin=dict(t=30, b=40, l=50, r=20)
+                    )
+                    st.plotly_chart(fig_ef, use_container_width=True)
+                    
+                    col_ef1, col_ef2, col_ef3 = st.columns(3)
+                    col_ef1.metric("Promedio - Reserva Eficiente", f"{df_rf['RESERVA_EFICIENTE_MW'].mean():.2f} MW")
+                    col_ef2.metric("Máxima - Reserva Eficiente", f"{df_rf['RESERVA_EFICIENTE_MW'].max():.2f} MW")
+                    col_ef3.metric("Mínima - Reserva Eficiente", f"{df_rf['RESERVA_EFICIENTE_MW'].min():.2f} MW")
+
+                    st.markdown("---")
+
+                    st.markdown("#### 3. Disponibilidad de Reserva Fría y Nodo Energético")
+                    limite_superior_nodo = df_rf['RESERVA_NODO_MW'].max() * 1.10
+
+                    fig_nodo = px.area(
+                        df_rf, x="FECHA_HORA", y="RESERVA_NODO_MW", 
+                        title="Curva de Reserva Fría y Nodo Energético (MW)",
+                        color_discrete_sequence=["#FF8C00"] 
+                    )
+                    fig_nodo.update_traces(hovertemplate="<b>%{y:,.2f} MW</b>", line=dict(width=0))
+                    fig_nodo.update_layout(
+                        hovermode="x unified",
+                        xaxis=dict(tickformat="%d/%m\n%H:%M", title="Fecha Operativa", range=[fecha_min_rf, fecha_max_rf], tickmode="linear", dtick=86400000),
+                        yaxis=dict(title="Reserva Nodo (MW)", range=[0, limite_superior_nodo]),
+                        height=350, margin=dict(t=30, b=40, l=50, r=20)
+                    )
+                    st.plotly_chart(fig_nodo, use_container_width=True)
+                    
+                    col_n1, col_n2, col_n3 = st.columns(3)
+                    col_n1.metric("Promedio - Reserva Nodo", f"{df_rf['RESERVA_NODO_MW'].mean():.2f} MW")
+                    col_n2.metric("Máxima - Reserva Nodo", f"{df_rf['RESERVA_NODO_MW'].max():.2f} MW")
+                    col_n3.metric("Mínima - Reserva Nodo", f"{df_rf['RESERVA_NODO_MW'].min():.2f} MW")
+
+                # ========================================================
+                # INYECCIÓN DE SECCIÓN: COSTOS MARGINALES
+                # ========================================================
+                st.markdown("---")
+                st.markdown("### 💰 Evolución de Costos Marginales de Corto Plazo (CMg)")
+                
+                if df_cmg_raw is None or df_cmg_raw.empty:
+                    st.warning("⚠️ No se encontraron archivos de Costos Marginales (.zip) para las fechas seleccionadas o el formato ha cambiado.")
+                else:
+                    df_cmg = df_cmg_raw.copy()
+                    fecha_min_cmg = df_cmg['FECHA_HORA'].min()
+                    fecha_max_cmg = df_cmg['FECHA_HORA'].max()
+                    
+                    colores_nodos = {
+                        "SANTA ROSA 220": "#E91E63", 
+                        "TALARA 220": "#8B4513",     
+                        "MOQUEGUA 220": "#4169E1"    
+                    }
+
+                    st.markdown("#### Dinámica de Precios (Soles/MWh) en Barras Estratégicas")
+                    
+                    fig_cmg = px.line(
+                        df_cmg, 
+                        x="FECHA_HORA", 
+                        y="COSTO_MARGINAL_SOLES", 
+                        color="NODO",
+                        title="Curvas de Costo Marginal - SEIN (Norte, Centro, Sur)",
+                        color_discrete_map=colores_nodos
+                    )
+                    
+                    fig_cmg.update_traces(hovertemplate="<b>%{y:,.2f} Soles/MWh</b>", connectgaps=True)
+                    
+                    fig_cmg.update_layout(
+                        hovermode="x unified",
+                        xaxis=dict(tickformat="%d/%m\n%H:%M", title="Fecha Operativa", range=[fecha_min_cmg, fecha_max_cmg], tickmode="linear", dtick=86400000),
+                        yaxis=dict(title="Costo Marginal (Soles/MWh)"),
+                        height=500, margin=dict(t=30, b=40, l=50, r=20),
+                        legend_title="Nodo (Barra)"
+                    )
+                    st.plotly_chart(fig_cmg, use_container_width=True)
+                    
+                    st.markdown("---")
+                    st.markdown("#### Estadísticas Operativas por Nodo (excluyendo vacíos)")
+                    
+                    col_cmg1, col_cmg2, col_cmg3 = st.columns(3)
+                    
+                    sr_data = df_cmg[df_cmg['NODO'] == 'SANTA ROSA 220']['COSTO_MARGINAL_SOLES']
+                    with col_cmg1:
+                        st.markdown("**🔴 SANTA ROSA 220 (Centro)**")
+                        st.metric("CMg Promedio", f"{sr_data.mean():.2f} Soles")
+                        st.metric("CMg Máximo", f"{sr_data.max():.2f} Soles")
+                        st.metric("CMg Mínimo", f"{sr_data.min():.2f} Soles")
+                    
+                    ta_data = df_cmg[df_cmg['NODO'] == 'TALARA 220']['COSTO_MARGINAL_SOLES']
+                    with col_cmg2:
+                        st.markdown("**🟤 TALARA 220 (Norte)**")
+                        st.metric("CMg Promedio", f"{ta_data.mean():.2f} Soles")
+                        st.metric("CMg Máximo", f"{ta_data.max():.2f} Soles")
+                        st.metric("CMg Mínimo", f"{ta_data.min():.2f} Soles")
+                        
+                    mo_data = df_cmg[df_cmg['NODO'] == 'MOQUEGUA 220']['COSTO_MARGINAL_SOLES']
+                    with col_cmg3:
+                        st.markdown("**🔵 MOQUEGUA 220 (Sur)**")
+                        st.metric("CMg Promedio", f"{mo_data.mean():.2f} Soles")
+                        st.metric("CMg Máximo", f"{mo_data.max():.2f} Soles")
+                        st.metric("CMg Mínimo", f"{mo_data.min():.2f} Soles")
+
+                    st.markdown("---")
+                    st.markdown("#### 📋 Trazabilidad y Auditoría de Datos")
+                    
+                    df_cmg_format = df_cmg.copy()
+                    df_cmg_format['FECHA'] = df_cmg_format['FECHA_HORA'].dt.strftime('%d/%m/%Y')
+                    df_cmg_format['HORA'] = df_cmg_format['FECHA_HORA'].dt.strftime('%H:%M')
+                    
+                    col_tab1, col_tab2 = st.columns(2)
+                    
+                    with col_tab1:
+                        st.markdown("**✔️ Registros Válidos (Utilizados para gráficas y promedios)**")
+                        df_validos = df_cmg_format.dropna(subset=['COSTO_MARGINAL_SOLES'])[['FECHA', 'HORA', 'NODO', 'COSTO_MARGINAL_SOLES']]
+                        st.dataframe(df_validos, use_container_width=True, hide_index=True)
+                        
+                    with col_tab2:
+                        st.markdown("**❌ Tramos con Falta de Datos (Omitidos en cálculo)**")
+                        df_faltantes = df_cmg_format[df_cmg_format['COSTO_MARGINAL_SOLES'].isna()][['FECHA', 'HORA', 'NODO']]
+                        if df_faltantes.empty:
+                            st.success("✅ No se detectaron vacíos de información en este periodo operativo.")
+                        else:
+                            st.dataframe(df_faltantes, use_container_width=True, hide_index=True)
 
         else:
-            st.warning("No se pudieron extraer datos de los archivos del COES para el rango seleccionado.")
+            st.warning("No se pudieron extraer datos operacionales de los anexos del COES para la ventana de tiempo estipulada.")
